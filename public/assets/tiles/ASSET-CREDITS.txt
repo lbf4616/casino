@@ -1,0 +1,9 @@
+牌面素材：mahjong-tiles (zddd312)
+https://github.com/zddd312/mahjong-tiles
+
+原始来源：
+- lietxia/mahjong_graphic — https://github.com/lietxia/mahjong_graphic
+- I.Mahjong（內木一郎，基于 GL-MahjongTile）— https://github.com/SyaoranHinata/I.Mahjong
+
+许可：M+ 字型授权条款
+这些牌面图片可自由使用、复制、分发和修改，无论是否商用，均无需授权，亦无担保。
