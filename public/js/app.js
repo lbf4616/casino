@@ -131,7 +131,6 @@ const state = {
   dismissedResult: null,
   actionInFlight: false,
   lastGameLogId: null,
-  lastDiscardKey: null,
   titleTurn: false,
   orientationDismissed: false,
   diceRolling: false,
@@ -366,7 +365,6 @@ function handleServerState(room) {
   const previousLogs = previous?.game?.log || [];
   const prevLastLogId = previousLogs.length ? previousLogs[previousLogs.length - 1].id : null;
   const previousOpening = previous?.game?.opening || null;
-  const seenDiscardKey = state.lastDiscardKey;
   const nextOpening = room.game?.opening || null;
 
   if (Number.isFinite(room.serverTime)) {
@@ -428,21 +426,7 @@ function handleServerState(room) {
     if (previous?.code === room.code && room.game.phase !== 'opening') {
       playLogFeedback(newLogs, previousRound !== room.game.roundNumber, room);
     }
-    const discard = room.game.lastDiscard;
-    const discardKey = discard
-      ? `${room.game.roundNumber}:${discard.seat}:${discard.tile.id}`
-      : null;
-    const freshDiscard = discard
-      && discardKey !== seenDiscardKey
-      && previousCode === room.code;
-    if (freshDiscard) {
-      const discarding = room.seats?.find((entry) => entry?.seat === discard.seat);
-      audio.announceDiscard(discard.tile, getCharacter(discarding?.avatar));
-    }
-    if (discardKey) state.lastDiscardKey = discardKey;
     if (room.game.log.length) state.lastGameLogId = room.game.log[room.game.log.length - 1].id;
-  } else {
-    state.lastDiscardKey = null;
   }
 
   render();
@@ -470,9 +454,11 @@ function playLogFeedback(logs, isNewRound, room) {
   else if (chosen.kind === 'peng') audio.play('peng');
   else if (chosen.kind === 'start') audio.play('start');
 
+  const actor = room?.seats?.find((entry) => entry?.seat === chosen.seat);
   if (['hu', 'gang', 'huihui', 'peng', 'chengdiao'].includes(chosen.kind)) {
-    const actor = room?.seats?.find((entry) => entry?.seat === chosen.seat);
     audio.announceAction(chosen.kind, getCharacter(actor?.avatar));
+  } else if (chosen.kind === 'discard' && chosen.tile) {
+    audio.announceDiscard(chosen.tile, getCharacter(actor?.avatar));
   }
 
   const shouldFlash = usable.filter((entry) => ['peng', 'gang', 'huihui', 'chengdiao', 'start', 'drawEnd'].includes(entry.kind));
@@ -490,7 +476,6 @@ function handleRoomClosed(payload) {
   state.showResult = false;
   state.modal = null;
   state.selectedTileId = null;
-  state.lastDiscardKey = null;
   state.orientationDismissed = false;
   state.diceRolling = false;
   clearOpeningTimers();
@@ -2166,7 +2151,6 @@ function resetToHome() {
   state.showResult = false;
   state.dismissedResult = null;
   state.modal = null;
-  state.lastDiscardKey = null;
   state.orientationDismissed = false;
   state.diceRolling = false;
   clearOpeningTimers();
@@ -2248,7 +2232,6 @@ function leaveInvite() {
   state.invite = null;
   state.screen = 'home';
   state.room = null;
-  state.lastDiscardKey = null;
   render();
 }
 

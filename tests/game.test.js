@@ -188,6 +188,17 @@ test('碰牌后由碰牌者出牌，且不能直接胡', () => {
   assert.equal(game.canDeclareWin(1), false);
 });
 
+test('出牌日志保留牌面信息，供客户端播报', () => {
+  const game = freshGame();
+  game.players[0].hand = tiles([['tong', 1], ['wan', 2], ['wan', 3]]);
+  const discard = game.players[0].hand.find((entry) => entry.key === 'tong-1');
+  game.discard(0, discard.id);
+  const log = game.log.findLast((entry) => entry.kind === 'discard');
+  assert.equal(game.lastDiscard, null);
+  assert.equal(log.seat, 0);
+  assert.deepEqual(log.tile, { id: discard.id, suit: 'tong', rank: 1, key: 'tong-1' });
+});
+
 test('明杠由点杠者付十分，并从牌尾补牌', () => {
   const game = freshGame();
   game.players[0].hand = tiles([

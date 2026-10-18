@@ -126,12 +126,13 @@ class Game {
     );
   }
 
-  addLog(kind, text, seat = null) {
+  addLog(kind, text, seat = null, tile = null) {
     this.log.push({
       id: `${this.logSeq}-${this.log.length + 1}`,
       kind,
       text,
       seat,
+      ...(tile ? { tile } : {}),
       at: Date.now(),
     });
     if (this.log.length > 80) this.log.shift();
@@ -391,7 +392,7 @@ class Game {
     this.hasDrawnThisTurn = false;
     this.lastDrawnId = null;
     this.lastDrawFromTail = false;
-    this.addLog('discard', `${player.name} 打出 ${tileLabel(tile)}`, seat);
+    this.addLog('discard', `${player.name} 打出 ${tileLabel(tile)}`, seat, publicTile(tile));
 
     const options = this.buildClaimOptions(tile, seat);
     if (Object.keys(options).length > 0) {
