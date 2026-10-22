@@ -30,9 +30,7 @@ function chooseDiscard(game, seat) {
   const wildCount = counts.get(laiziKey) || 0;
   let candidates = uniqueKeys(player.hand);
 
-  if (wildCount > 1) {
-    candidates = [laiziKey];
-  } else if (wildCount === 1) {
+  if (wildCount > 0) {
     const withoutWild = candidates.filter((key) => key !== laiziKey);
     if (withoutWild.length) candidates = withoutWild;
   }
@@ -80,11 +78,14 @@ function decideSelfTurn(game, seat) {
   if (actions.canWin) return { type: 'win' };
 
   const player = game.playerAt(seat);
-  if (actions.canChengdiao && game.getWildCount(player) === 0 && Math.random() < 0.28) {
-    return { type: 'chengdiao' };
+  const wildCount = game.getWildCount(player);
+  if (actions.canChengdiao && wildCount > 1) {
+    const laizi = player.hand.find((tile) => tile.key === game.laiziKey);
+    if (laizi) return { type: 'chengdiao', tileId: laizi.id };
   }
 
-  if (actions.gangs.length > 0 && game.wall.length > 0 && Math.random() < 0.82) {
+  const canGangNow = game.wall.length > 0 || actions.gangs.some((gang) => gang.kind === 'tail');
+  if (actions.gangs.length > 0 && canGangNow && Math.random() < 0.82) {
     const gang = actions.gangs[Math.floor(Math.random() * actions.gangs.length)];
     return {
       type: 'gang',

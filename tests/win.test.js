@@ -87,3 +87,8 @@ test('听牌时向听数为零', () => {
   ]);
   assert.equal(estimateShanten(tiles, 0, 'tong-1'), 0);
 });
+
+test('one wildcard used as its printed tile is a hard win', () => {
+  const tiles = hand([['wan', 1], ['wan', 2], ['wan', 3], ['wan', 4], ['wan', 5], ['wan', 6], ['tiao', 2, 3], ['tong', 7, 3], ['tong', 9, 2]]);
+  assert.deepEqual(evaluateWin(tiles, 0, 'wan-2'), { win: true, wildCount: 1, soft: false });
+});

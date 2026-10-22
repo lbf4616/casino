@@ -1,6 +1,6 @@
 import { CHARACTERS, getCharacter, avatarHTML } from './characters.js?v=20261018-17';
-import { renderTile, renderBack, renderMeld, tileLabel } from './tiles.js?v=20261018-17';
-import { audio } from './sound.js?v=20261018-17';
+import { renderTile, renderBack, renderMeld, tileLabel } from './tiles.js?v=20261018-18';
+import { audio } from './sound.js?v=20261022-2';
 
 const ROOM_STORAGE = 'heyuan.room';
 const CLIENT_STORAGE = 'heyuan.client';
@@ -9,6 +9,8 @@ const PROFILE_COOKIE = 'heyuan_identity';
 const PROFILE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365 * 2;
 const WINDS = ['东', '南', '西', '北'];
 const CLAIM_WINDOW = 10000;
+const TURN_LIMIT = 30000;
+const INITIAL_BALANCE = 1000;
 
 const appRoot = document.getElementById('appRoot');
 const modalRoot = document.getElementById('modalRoot');
@@ -102,17 +104,6 @@ function cleanInviteName(value) {
     .slice(0, 12);
 }
 
-function readInviteFromUrl() {
-  try {
-    const params = new URLSearchParams(window.location.search);
-    const code = String(params.get('room') || '').trim().toUpperCase();
-    if (!/^[A-Z0-9]{4}$/.test(code)) return null;
-    return { code, from: cleanInviteName(params.get('from')) };
-  } catch (error) {
-    return null;
-  }
-}
-
 const initialProfile = loadProfile();
 
 const state = {
@@ -123,9 +114,10 @@ const state = {
   identityRemembered: initialProfile.remembered,
   identityEditing: false,
   identitySaved: { avatar: initialProfile.avatar, name: initialProfile.name },
-  invite: readInviteFromUrl(),
+  invite: null,
   room: null,
   selectedTileId: null,
+  balances: null,
   modal: null,
   showResult: false,
   dismissedResult: null,
@@ -138,6 +130,7 @@ const state = {
 };
 
 let openingTimers = [];
+let turnWarningDeadline = null;
 
 const clientId = getClientId();
 const socket = io({
@@ -158,16 +151,48 @@ function isMobileDevice() {
   return Boolean(coarse && navigator.maxTouchPoints > 0 && shortSide > 0 && shortSide <= 900);
 }
 
+function isIOSDevice() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/i.test(ua)) return true;
+  return navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+}
+
+function isStandaloneApp() {
+  return window.navigator.standalone === true
+    || Boolean(window.matchMedia?.('(display-mode: standalone)').matches)
+    || Boolean(window.matchMedia?.('(display-mode: fullscreen)').matches);
+}
+
+window.matchMedia?.('(display-mode: standalone)').addEventListener('change', () => {
+  if (isStandaloneApp()) appRoot.querySelector('.home-screen-hint')?.remove();
+});
+
+function renderHomeScreenHint() {
+  if (isStandaloneApp() || state.homeScreenHintDismissed) return '';
+  const instruction = isWeChatBrowser()
+    ? '先用浏览器打开，再点「共享」→「添加到主屏幕」。'
+    : '点浏览器的「共享」（分享）→「添加到主屏幕」。';
+  return `<aside class="home-screen-hint" role="note" aria-label="添加到主屏幕提示">
+    <div><strong>添加到主屏幕，打开更方便</strong><span>${instruction}以后从桌面图标进入，即可全屏游玩。${isIOSDevice() ? '' : '也可在浏览器菜单中选择「安装应用」或「添加到主屏幕」。'}</span></div>
+    <button type="button" class="icon-button" data-action="dismiss-home-screen-hint" aria-label="关闭主屏幕提示">${ICON.close}</button>
+  </aside>`;
+}
+
 function isPortrait() {
   return window.matchMedia?.('(orientation: portrait)').matches
     ?? window.innerHeight >= window.innerWidth;
+}
+
+function supportsAutoLandscape() {
+  return typeof document.documentElement.requestFullscreen === 'function'
+    && typeof screen.orientation?.lock === 'function';
 }
 
 function buildInviteUrl(code, from) {
   const url = new URL(window.location.href);
   url.search = '';
   url.hash = '';
-  url.searchParams.set('room', code);
+
   const inviter = cleanInviteName(from);
   if (inviter) url.searchParams.set('from', inviter);
   return url.toString();
@@ -236,6 +261,29 @@ function formatScore(score) {
   return String(score);
 }
 
+function balanceOf(characterId) {
+  const value = state.balances?.[characterId];
+  return Number.isFinite(value) ? value : INITIAL_BALANCE;
+}
+
+function fundsText(value) {
+  return `${value} 元`;
+}
+
+async function loadBalances(refresh = false) {
+  try {
+    const response = await fetch('/api/scores', { cache: 'no-store' });
+    if (!response.ok) return;
+    const payload = await response.json();
+    if (payload?.scores && typeof payload.scores === 'object') {
+      state.balances = payload.scores;
+      if (refresh && state.screen === 'home') render();
+    }
+  } catch (error) {
+    // The table still works with the default starting funds.
+  }
+}
+
 function serverNow() {
   return Date.now() + state.serverOffset;
 }
@@ -291,6 +339,55 @@ function flashTable(text, type = 'info') {
   setTimeout(() => node.remove(), 1900);
 }
 
+function actionLabel(kind) {
+  if (kind === 'peng') return '碰';
+  if (kind === 'chengdiao') return '惩';
+  if (['gang', 'huihui'].includes(kind)) return '杠';
+  return '';
+}
+
+function seatEffectAnchor(seat) {
+  const pod = appRoot.querySelector(`.machine-pod[data-seat="${seat}"], .self-identity[data-seat="${seat}"]`);
+  const avatar = pod?.querySelector('.pod-avatar, .self-avatar');
+  if (!avatar) return null;
+  const rect = avatar.getBoundingClientRect();
+  return {
+    x: Math.max(48, Math.min(window.innerWidth - 48, rect.left + rect.width / 2)),
+    y: Math.max(64, rect.top),
+  };
+}
+
+function showSeatAction(entry) {
+  const label = actionLabel(entry.kind);
+  if (!flashLayer || !label || entry.seat === null || entry.seat === undefined) return;
+  const anchor = seatEffectAnchor(entry.seat);
+  if (!anchor) return;
+  const node = document.createElement('span');
+  node.className = `seat-action-pop seat-action-pop--${entry.kind}`;
+  node.textContent = label;
+  node.style.left = `${anchor.x}px`;
+  node.style.top = `${anchor.y - 36}px`;
+  flashLayer.appendChild(node);
+  requestAnimationFrame(() => node.classList.add('is-visible'));
+  setTimeout(() => node.classList.add('is-leaving'), 1050);
+  setTimeout(() => node.remove(), 1450);
+
+  (entry.scoreChanges || []).forEach((change) => {
+    const changeAnchor = seatEffectAnchor(change.seat);
+    if (!changeAnchor || !change.delta) return;
+    const amount = document.createElement('span');
+    amount.className = `seat-score-pop ${change.delta > 0 ? 'is-positive' : 'is-negative'}`;
+    amount.textContent = formatScore(change.delta);
+    amount.style.left = `${changeAnchor.x}px`;
+    amount.style.top = `${changeAnchor.y + 18}px`;
+    amount.style.right = 'auto';
+    flashLayer.appendChild(amount);
+    requestAnimationFrame(() => amount.classList.add('is-visible'));
+    setTimeout(() => amount.classList.add('is-leaving'), 1150);
+    setTimeout(() => amount.remove(), 1550);
+  });
+}
+
 function setModal(modal) {
   state.modal = modal;
   renderModal();
@@ -315,10 +412,10 @@ function rulesButton() {
 
 function brandHTML(small = false) {
   return `<div class="brand${small ? ' brand--small' : ''}">
-    <span class="brand-seal" aria-hidden="true">合</span>
+    <img class="brand-seal" src="/assets/app-icon-192.png?v=20261021-5" alt="" aria-hidden="true">
     <span class="brand-copy">
-      <strong>合院棋牌室</strong>
-      <small>${small ? '湖北麻将 · 108 张' : '家里人的一桌牌'}</small>
+      <strong>牛牛棋牌室</strong>
+      ${small ? '' : '<small>家里人的一桌牌</small>'}
     </span>
   </div>`;
 }
@@ -388,8 +485,20 @@ function handleServerState(room) {
   const result = room.game?.result;
   const resultKey = result ? `${room.code}:${room.game.roundNumber}` : null;
   if (result) {
-    if (state.dismissedResult !== resultKey) state.showResult = true;
+    if (!previous?.game?.result && previous?.game && result.type === 'win') {
+      state.showResult = false;
+      state.resultEffectKey = resultKey;
+      setTimeout(() => {
+        if (state.resultEffectKey !== resultKey || `${state.room?.code}:${state.room?.game?.roundNumber}` !== resultKey) return;
+        state.resultEffectKey = null;
+        if (state.dismissedResult !== resultKey) state.showResult = true;
+        render();
+      }, 2400);
+    } else if (state.resultEffectKey !== resultKey && state.dismissedResult !== resultKey) {
+      state.showResult = true;
+    }
   } else {
+    state.resultEffectKey = null;
     state.showResult = false;
     state.dismissedResult = null;
   }
@@ -412,6 +521,7 @@ function handleServerState(room) {
   }
   if (!nextOpening?.rolledAt) state.diceRolling = false;
 
+  let feedbackLogs = [];
   if (room.game) {
     const newLogs = [];
     if (previous?.game && previousRound === room.game.roundNumber) {
@@ -424,12 +534,13 @@ function handleServerState(room) {
       newLogs.push(...room.game.log.slice(-3));
     }
     if (previous?.code === room.code && room.game.phase !== 'opening') {
-      playLogFeedback(newLogs, previousRound !== room.game.roundNumber, room);
+      feedbackLogs = newLogs;
     }
     if (room.game.log.length) state.lastGameLogId = room.game.log[room.game.log.length - 1].id;
   }
 
   render();
+  playLogFeedback(feedbackLogs, previousRound !== room.game?.roundNumber, room);
 }
 
 function playLogFeedback(logs, isNewRound, room) {
@@ -444,10 +555,16 @@ function playLogFeedback(logs, isNewRound, room) {
     return;
   }
 
+  usable.filter((entry) => actionLabel(entry.kind)).forEach(showSeatAction);
+
   const priority = { hu: 6, gang: 5, huihui: 4, chengdiao: 3, peng: 2, start: 2, discard: 1, drawEnd: 0 };
   usable.sort((a, b) => (priority[a.kind] || 0) - (priority[b.kind] || 0));
   const chosen = usable[usable.length - 1];
-  if (chosen.kind === 'hu') audio.play('hu');
+  if (chosen.kind === 'hu') {
+    audio.play('hu');
+    audio.announceWin(room.game?.result?.soft, getCharacter(room?.seats?.find((entry) => entry?.seat === chosen.seat)?.avatar));
+    flashTable(`自摸（${room.game?.result?.soft ? '软的' : '黑的'}）`, 'hu');
+  }
   else if (chosen.kind === 'gang') audio.play('gang');
   else if (chosen.kind === 'huihui') audio.play('gang');
   else if (chosen.kind === 'chengdiao') audio.play('select');
@@ -456,12 +573,12 @@ function playLogFeedback(logs, isNewRound, room) {
 
   const actor = room?.seats?.find((entry) => entry?.seat === chosen.seat);
   if (['hu', 'gang', 'huihui', 'peng', 'chengdiao'].includes(chosen.kind)) {
-    audio.announceAction(chosen.kind, getCharacter(actor?.avatar));
+    if (chosen.kind !== 'hu') audio.announceAction(chosen.kind, getCharacter(actor?.avatar));
   } else if (chosen.kind === 'discard' && chosen.tile) {
     audio.announceDiscard(chosen.tile, getCharacter(actor?.avatar));
   }
 
-  const shouldFlash = usable.filter((entry) => ['peng', 'gang', 'huihui', 'chengdiao', 'start', 'drawEnd'].includes(entry.kind));
+  const shouldFlash = usable.filter((entry) => ['start', 'drawEnd'].includes(entry.kind));
   if (shouldFlash.length) {
     const latest = shouldFlash[shouldFlash.length - 1];
     flashTable(latest.text, latest.kind);
@@ -482,6 +599,7 @@ function handleRoomClosed(payload) {
   exitLandscapeMode();
   render();
   showToast(payload?.reason === 'idle' ? '房间很久没人，已经收桌了' : '这个牌局已经结束', 'info');
+  loadBalances(true);
 }
 
 socket.on('connect', async () => {
@@ -494,7 +612,7 @@ socket.on('connect', async () => {
   } else if (state.room) {
     await resumeCurrentRoom();
   } else {
-    render();
+    await bootIntoRoom();
   }
 });
 
@@ -511,27 +629,59 @@ socket.on('connect_error', () => {
   render();
 });
 
+socket.on('session:replaced', () => {
+  socket.disconnect();
+  sessionStorage.removeItem(ROOM_STORAGE);
+  state.room = null;
+  state.online = false;
+  state.screen = 'home';
+  state.modal = null;
+  state.showResult = false;
+  render();
+  showToast('角色已在其他设备登录，本设备已退出', 'info');
+});
+
+const DANMAKU_PHRASES = {
+  lobby: ['快开局吧', '快拉人', '还有人吗', '人齐就开', '准备好了！'],
+  game: ['等到花都谢了', '快出牌呀', '打得漂亮', '这牌有点难', '好运快来！'],
+};
+let danmakuNextLane = 0;
+let danmakuNextAt = 0;
+socket.on('room:danmaku', (message) => {
+  if (!state.room || message.code !== state.room.code || !Object.values(DANMAKU_PHRASES).flat().includes(message.phrase)) return;
+  let layer = document.getElementById('danmaku-layer');
+  if (!layer) {
+    layer = document.createElement('div');
+    layer.id = 'danmaku-layer';
+    layer.className = 'danmaku-layer';
+    layer.setAttribute('aria-hidden', 'true');
+    document.body.append(layer);
+  }
+  const bubble = document.createElement('div');
+  bubble.className = 'danmaku-bubble';
+  bubble.style.setProperty('--danmaku-lane', String(danmakuNextLane++ % 3));
+  const delay = Math.max(0, danmakuNextAt - Date.now());
+  danmakuNextAt = Date.now() + delay + 650;
+  bubble.style.animationDelay = `${delay}ms`;
+  bubble.innerHTML = `${avatarHTML(message.avatar)}<span>${escapeHTML(message.phrase)}</span>`;
+  bubble.addEventListener('animationend', () => bubble.remove(), { once: true });
+  layer.append(bubble);
+});
+
 socket.on('room:state', handleServerState);
 socket.on('room:closed', handleRoomClosed);
 socket.on('server:error', (payload) => {
   showToast(payload?.error || '连接出现问题，请刷新页面', 'error');
 });
 
+loadBalances(true);
+
 async function bootIntoRoom() {
   const savedCode = sessionStorage.getItem(ROOM_STORAGE);
-  if (state.invite) {
-    if (savedCode && savedCode !== state.invite.code) {
-      await request('room:leave', {}, { silent: true });
-      sessionStorage.removeItem(ROOM_STORAGE);
-    }
-    state.room = null;
-    state.screen = 'home';
-    render();
-    return;
-  }
   if (!savedCode) {
     state.screen = state.hasConnected ? 'home' : 'loading';
     render();
+    if (state.identityRemembered) await createRoom();
     return;
   }
   state.screen = 'loading';
@@ -542,7 +692,7 @@ async function bootIntoRoom() {
     state.room = null;
     state.screen = 'home';
     render();
-    showToast('上次的牌局已经结束，重新开一桌吧', 'info');
+    if (state.identityRemembered) await createRoom();
   } else {
     render();
   }
@@ -584,18 +734,110 @@ function render() {
   } else {
     appRoot.innerHTML = renderGame();
   }
+  if (state.room && (state.screen === 'room' || state.screen === 'game')) {
+    const category = state.room.game && state.room.game.phase !== 'ended' ? 'game' : 'lobby';
+    appRoot.querySelector('.screen')?.insertAdjacentHTML('beforeend', `<div class="danmaku-control"><button type="button" class="danmaku-trigger" data-action="open-danmaku" aria-label="发送快捷弹幕" aria-expanded="false" aria-controls="danmaku-options">聊两句</button><div id="danmaku-options" class="danmaku-options" hidden>${DANMAKU_PHRASES[category].map((phrase) => `<button type="button" data-action="send-danmaku" data-phrase="${escapeHTML(phrase)}">${escapeHTML(phrase)}</button>`).join('')}</div></div>`);
+  } else {
+    document.getElementById('danmaku-layer')?.remove();
+    danmakuNextAt = 0;
+  }
+  const portraitBlocked = isMobileDevice() && isPortrait();
+  appRoot.querySelector('.screen')?.toggleAttribute('inert', portraitBlocked);
+  appRoot.insertAdjacentHTML('beforeend', orientationOverlay());
+  if (state.screen !== 'loading') appRoot.insertAdjacentHTML('beforeend', renderHomeScreenHint());
   document.body.dataset.screen = state.screen;
   document.body.classList.toggle('has-offline', !state.online);
   updateDocumentTitle();
   tickCountdowns();
+  syncTableSize();
+  syncDockHeight();
   scheduleOpeningAnimation();
+}
+
+function syncTableSize() {
+  const tables = [
+    ['.game-table-shell', '.game-table-rim'],
+    ['.opening-stage', '.opening-machine'],
+  ];
+  for (const [shellSelector, tableSelector] of tables) {
+    const shell = appRoot.querySelector(shellSelector);
+    const table = shell?.querySelector(tableSelector);
+    if (!shell || !table) continue;
+    const style = getComputedStyle(shell);
+    const availW = shell.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const availH = shell.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+    if (availW <= 0 || availH <= 0) continue;
+    const dist = 1000;
+    const sin = Math.sin((24 * Math.PI) / 180);
+    const cos = Math.cos((24 * Math.PI) / 180);
+    const ratio = 1.62;
+    const landscape = availW > availH;
+    const tableStyle = getComputedStyle(table);
+    const rim = parseFloat(tableStyle.getPropertyValue('--rim-pad') || tableStyle.getPropertyValue('--machine-pad'));
+    const inset = landscape ? (parseFloat(getComputedStyle(table.querySelector('.machine-rim') || table).paddingBottom) || rim || 0) : 0;
+    // Fit the inner bottom edge; the front rim may extend beyond the viewport.
+    let low = 0;
+    let high = Math.min(availW, dist / sin * ratio * 0.9);
+    for (let step = 0; step < 40; step += 1) {
+      const candidate = (low + high) / 2;
+      const depth = Math.max(0, candidate / ratio - inset);
+      const scale = dist / (dist - depth * sin);
+      if (Math.max(0, candidate - 2 * inset) * scale > availW || depth * cos * scale > availH) high = candidate;
+      else low = candidate;
+    }
+    let width = low;
+    let height = width / ratio;
+    let shift;
+    if (landscape) {
+      const top = inset * cos * dist / (dist - inset * sin);
+      const bottom = availH + top;
+      const depth = bottom * dist / (dist * cos + bottom * sin);
+      height = depth + inset;
+      width = availW * (dist - depth * sin) / dist + 2 * inset;
+      shift = -top;
+    } else {
+      const projected = height * cos * dist / (dist - height * sin);
+      shift = Math.max(0, (availH - projected) / 2);
+    }
+    table.style.setProperty('--table-ratio', String(width / height));
+    // The play felt is inset by the rim, so deriving its tiles from its own cqh makes them
+    // smaller than the deal table's; both phases instead share one scale from the table height.
+    const tileW = Math.min(30, Math.max(9, height * 0.0434));
+    table.style.setProperty('--table-w', `${width.toFixed(2)}px`);
+    table.style.setProperty('--table-shift', `${shift.toFixed(2)}px`);
+    table.style.setProperty('--table-tile-w', `${tileW.toFixed(2)}px`);
+    const shellRect = shell.getBoundingClientRect();
+    const viewportHeight = window.visualViewport?.height || window.innerHeight;
+    const visibleTop = Math.max(0, shellRect.top) + 6;
+    const visibleBottom = Math.min(viewportHeight, shellRect.bottom) - 6;
+    for (const pod of table.querySelectorAll('.machine-pod--top, .machine-pod--bottom')) {
+      pod.style.translate = 'none';
+      let offset = 0;
+      for (let step = 0; step < 3; step += 1) {
+        const rect = pod.getBoundingClientRect();
+        const correction = rect.top < visibleTop ? visibleTop - rect.top
+          : rect.bottom > visibleBottom ? visibleBottom - rect.bottom : 0;
+        if (Math.abs(correction) < 0.5) break;
+        const scale = rect.width / pod.offsetWidth || 1;
+        offset += correction / scale;
+        pod.style.translate = `0 ${offset.toFixed(2)}px`;
+      }
+    }
+  }
+}
+
+function syncDockHeight() {
+  const felt = appRoot.querySelector('.game-table-felt');
+  const dock = appRoot.querySelector('.self-dock');
+  if (!felt || !dock) return;
+  felt.style.setProperty('--dock-h', `${dock.offsetHeight}px`);
 }
 
 function renderLoading() {
   return `<div class="screen loading-screen">
     <div class="loading-brand">
       <span class="brand-seal brand-seal--large">合</span>
-      <h1>合院棋牌室</h1>
+      <h1>牛牛棋牌室</h1>
       <p>正在摆好牌桌…</p>
       <div class="loading-line"><span></span></div>
     </div>
@@ -615,7 +857,7 @@ function identityCardHTML() {
     <span class="identity-copy">
       <small>这台设备记得你</small>
       <strong>${escapeHTML(customName || character.name)}</strong>
-      <em>${customName ? `${character.name} · 属${character.animal}` : `生肖 · ${character.animal}`}</em>
+      <em>${customName ? `${character.name} · 属${character.animal}` : `生肖 · ${character.animal}`} · 资金 ${fundsText(balanceOf(character.id))}</em>
     </span>
     <button type="button" class="identity-edit" data-action="edit-identity">换角色</button>
   </div>`;
@@ -642,14 +884,14 @@ function identityEntryHTML(context, code = '') {
       ? '选好后，这台设备会改记新的角色。'
       : '选好后，这台设备会记住你，下次打开不用再选。称呼可以留空。';
   const foot = mode === 'returning'
-    ? '不是你？点「换角色」重新挑一次'
+    ? '角色资金存在服务器 · 有 AI 参战的牌局不记账'
     : mode === 'edit'
-      ? '换好之后，下次打开就直接用新角色入座'
-      : '这台设备会记住你 · 仅记积分';
-  const formId = mode === 'edit' ? 'identity-form' : context === 'invite' ? 'invite-form' : 'create-form';
+      ? '换好之后，资金跟着新角色走'
+      : '每人初始 1000 元 · 有 AI 参战的牌局不记账';
+  const formId = mode === 'edit' ? 'identity-form' : 'create-form';
   const submitLabel = mode === 'edit'
     ? '记住这个角色'
-    : context === 'invite' ? `加入房间 ${escapeHTML(code)}` : '开一桌';
+    : '直接入座';
   return `<div class="entry-heading">
       <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>入座</p>
       <h2 id="entry-title">${heading}</h2>
@@ -667,7 +909,6 @@ function identityEntryHTML(context, code = '') {
 }
 
 function renderHome() {
-  if (state.invite) return renderInviteHome();
   return `<div class="screen home-screen">
     ${offlineBanner()}
     <div class="home-ornaments" aria-hidden="true">
@@ -686,7 +927,7 @@ function renderHome() {
         <div class="hero-copy">
           <p class="eyebrow"><span class="eyebrow-line"></span>湖北麻将 · 一百零八张</p>
           <h1>家里人齐了，<br><em>就开一桌。</em></h1>
-          <p class="hero-intro">不用注册，不必登录。挑一个角色，把邀请链接发进家里群，四个人坐下就能开局。人不齐也不要紧，空位交给 AI 邻居。</p>
+          <p class="hero-intro">不用注册，不必登录。家里人共用这一桌，选好角色就自动落座，四个座位坐满就不能再进。人不齐时，也可以让 AI 邻居补位开局。</p>
           <div class="hero-scene" aria-hidden="true">
             <div class="hero-table">
               <span class="hero-table-line"></span>
@@ -695,7 +936,7 @@ function renderHome() {
                 ${renderTile({ suit: 'tong', rank: 8, key: 'tong-8' }, { size: 'hero' })}
                 ${renderTile({ suit: 'tiao', rank: 3, key: 'tiao-3' }, { size: 'hero' })}
               </div>
-              <span class="hero-stamp">合院<br>小局</span>
+              <span class="hero-stamp">牛牛<br>小局</span>
               <span class="hero-table-caption">四方桌 · 家人闲坐</span>
             </div>
           </div>
@@ -705,57 +946,16 @@ function renderHome() {
             <div><strong>只</strong><span>自摸得胡</span></div>
           </div>
         </div>
+      </section>
         <section class="entry-panel" aria-labelledby="entry-title">
           ${identityEntryHTML('home')}
         </section>
       </main>
       <footer class="site-footer">
-        <span>合院棋牌室 · 湖北 108 张</span>
+        <span>牛牛棋牌室</span>
         <span>给家里人的一桌牌</span>
       </footer>
     </div>`;
-}
-
-function renderInviteHome() {
-  const invite = state.invite;
-  const inviter = invite.from;
-  return `<div class="screen home-screen invite-home">
-    ${offlineBanner()}
-    <div class="home-ornaments" aria-hidden="true">
-      <div class="home-ornament home-ornament--one"></div>
-      <div class="home-ornament home-ornament--two"></div>
-    </div>
-    <header class="site-header">
-      <div class="header-lead">
-        <button class="icon-button" type="button" data-action="leave-invite" aria-label="返回主页" title="返回主页">${ICON.back}</button>
-        ${brandHTML()}
-      </div>
-      <div class="header-tools">
-        ${rulesButton()}
-        ${soundButton()}
-      </div>
-    </header>
-    <main class="invite-main">
-      <div class="invite-home-heading">
-        <p class="eyebrow"><span class="eyebrow-line"></span>家里人喊你来打牌</p>
-        <h1>${inviter ? `${escapeHTML(inviter)} 喊你` : '喊你一起'}<em>来坐一桌。</em></h1>
-      </div>
-      <section class="entry-panel entry-panel--invite" aria-labelledby="entry-title">
-        <div class="invite-callout">
-          <span class="invite-callout-seal" aria-hidden="true">合</span>
-          <span class="invite-callout-copy">
-            <strong>${inviter ? `${escapeHTML(inviter)} 邀你入座` : '家里人邀你入座'}</strong>
-            <small>房间 <b>${escapeHTML(invite.code)}</b> · 点开链接就能坐</small>
-          </span>
-        </div>
-        ${identityEntryHTML('invite', invite.code)}
-      </section>
-    </main>
-    <footer class="site-footer">
-      <span>合院棋牌室 · 湖北 108 张</span>
-      <span>给家里人的一桌牌</span>
-    </footer>
-  </div>`;
 }
 
 function characterCard(character) {
@@ -763,6 +963,7 @@ function characterCard(character) {
   return `<button type="button" class="character-card${selected ? ' is-selected' : ''}" data-action="select-avatar" data-avatar="${character.id}" role="option" aria-selected="${selected}" aria-label="${character.name}，属${character.animal}">
     <span class="character-portrait">${avatarHTML(character.id, { className: 'character-avatar' })}</span>
     <span class="character-name">${character.name}<small>${character.animal}</small></span>
+    <span class="character-funds">${fundsText(balanceOf(character.id))}</span>
     <span class="character-motto">${character.motto}</span>
     <span class="character-check" aria-hidden="true"></span>
   </button>`;
@@ -780,7 +981,7 @@ function renderLobby() {
     ${offlineBanner()}
     <header class="site-header site-header--compact">
       ${brandHTML(true)}
-      <div class="lobby-room-chip"><span>房间</span><b>${escapeHTML(room.code)}</b></div>
+      <div class="lobby-room-chip"><span>家里人的</span><b>一桌牌</b></div>
       <div class="header-tools">
         ${rulesButton()}
         ${soundButton()}
@@ -795,7 +996,7 @@ function renderLobby() {
     : '东家开局后，牌局就会开始。现在可以点空位换个顺手的位置。'}</p>
         <div class="invite-box">
           <div class="invite-head">
-            <span class="invite-label">房间 ${escapeHTML(room.code)} · 把这桌告诉家里人</span>
+            <span class="invite-label">就这一桌 · 喊家里人来坐</span>
             <span class="invite-count">${occupied} / 4 已入座</span>
           </div>
           <button type="button" class="invite-share" data-action="share-invite">
@@ -803,7 +1004,7 @@ function renderLobby() {
             <span class="invite-share-copy"><b>发送邀请链接</b><small>家里人点开就能入座</small></span>
             ${ICON.arrow}
           </button>
-          <span class="invite-hint">发到家庭群即可，不用再报房间号</span>
+          <span class="invite-hint">发到家庭群即可，大家都进同一桌</span>
         </div>
         <div class="lobby-controls">
           ${isHost
@@ -827,13 +1028,13 @@ function renderLobby() {
         </div>
         <p class="seating-tip">${you ? '点击空位可以换座位 · 开局后不可换座' : '选择空位入座'}</p>
         <div class="mini-rule-strip">
-          <span>只能自摸</span><span>赖子限一张</span><span>不能吃</span>
+          <span>只能自摸</span><span>赖子限一张</span><span>不能吃</span><span>AI 局不记账</span>
         </div>
       </section>
     </main>
     <footer class="site-footer">
-      <span>房间 ${escapeHTML(room.code)}</span>
-      <span>合院棋牌室 · 无登录牌局</span>
+      <span>家里人共用一桌 · 四个座位</span>
+      <span>牛牛棋牌室 · 无登录牌局</span>
     </footer>
   </div>`;
 }
@@ -856,7 +1057,7 @@ function lobbySeatCard(seat, index, hostSeat, viewerSeat) {
     <span class="seat-avatar">${avatarHTML(seat.avatar, { className: 'seat-avatar-svg' })}</span>
     <div class="seat-person">
       <strong>${escapeHTML(seat.name)}${isYou ? '<span class="you-mark">你</span>' : ''}</strong>
-      <span>${isHost ? '东家' : character.animal}${seat.connected === false ? ' · 暂离' : ''}</span>
+      <span>${isHost ? '东家' : character.animal}${seat.connected === false ? ' · 暂离' : ''} · ${fundsText(seat.score)}</span>
     </div>
     ${isHost ? '<span class="host-mark">东</span>' : ''}
   </div>`;
@@ -883,7 +1084,11 @@ function renderGame() {
   if (!state.room?.game) return renderLoading();
   const room = state.room;
   const game = room.game;
-  if (game.phase === 'opening') return renderOpening(room, game);
+  if (game.phase === 'opening') {
+    const breakOrder = openingWallBreakOrder(game);
+    if (breakOrder !== null) rememberPlayWallBreak(room, game, breakOrder);
+    return renderOpening(room, game);
+  }
   const you = game.you;
   const players = getCombinedPlayers(game);
   const viewerSeat = you.seat;
@@ -911,37 +1116,82 @@ function renderGame() {
             ${offlineBanner()}
             ${renderTopOpponent(topPlayer, game)}
             <div class="stage-middle">
-              ${renderSideOpponent(leftPlayer, 'left', game)}
+              ${renderPlayWall(game)}
               <div class="river-board">
                 ${renderRiverLane(topPlayer, 'top', game, viewerSeat)}
-                <div class="river-middle">
-                  ${renderRiverLane(leftPlayer, 'left', game, viewerSeat)}
-                  ${renderRiverLane(rightPlayer, 'right', game, viewerSeat)}
-                </div>
+                ${renderRiverLane(leftPlayer, 'left', game, viewerSeat)}
+                ${renderRiverLane(rightPlayer, 'right', game, viewerSeat)}
                 ${renderRiverLane(selfPlayer, 'self', game, viewerSeat)}
               </div>
-              ${renderSideOpponent(rightPlayer, 'right', game)}
             </div>
+            ${renderSideOpponent(leftPlayer, 'left', game)}
+            ${renderSideOpponent(rightPlayer, 'right', game)}
             ${renderPendingNotice(game, players, viewerSeat)}
           </main>
-          <footer class="self-dock">
-            <div class="dock-top">
-              ${renderSelfIdentity(selfPlayer, game, you)}
-              ${renderDockActions(room, game, actions, selectedTile, isMyTurn)}
-            </div>
-            ${renderSelfMelds(you, game)}
-            ${renderHand(you, game, actions, isMyTurn, selectedTile)}
-          </footer>
         </div>
+        ${renderPlayPod(topPlayer, 'top', game)}
+        ${renderPlayPod(leftPlayer, 'left', game)}
+        ${renderPlayPod(rightPlayer, 'right', game)}
+        <footer class="self-dock">
+          <div class="dock-top">
+            ${renderSelfIdentity(selfPlayer, game, you)}
+            ${renderDockActions(room, game, actions, selectedTile, isMyTurn)}
+          </div>
+          ${renderSelfMelds(you, game, selfPlayer)}
+          ${renderHand(you, game, actions, isMyTurn, selectedTile)}
+        </footer>
       </div>
     </div>
-    ${orientationOverlay()}
     ${state.showResult ? renderResult(room, game, players) : ''}
   </div>`;
 }
 
 const OPENING_WALL_SIDES = { top: 14, right: 13, bottom: 14, left: 13 };
 const OPENING_WALL_TOTAL_STACKS = 54;
+let playWallBreak = { roundNumber: null, seat: null, order: null };
+
+function playWallStoreKey(room) {
+  return room?.code ? `heyuan-play-wall:${room.code}` : null;
+}
+
+function rememberedPlayWallBreak(room, game) {
+  const key = playWallStoreKey(room);
+  if (!key) return null;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(key));
+    if (!saved || Number(saved.roundNumber) !== game.roundNumber) return null;
+    if (game.you && saved.seat !== game.you.seat) return null;
+    const order = Number(saved.order);
+    if (!Number.isInteger(order) || order < 0 || order >= OPENING_WALL_TOTAL_STACKS) return null;
+    return order;
+  } catch {
+    return null;
+  }
+}
+
+function rememberPlayWallBreak(room, game, order) {
+  const seat = game.you?.seat ?? null;
+  playWallBreak = { roundNumber: game.roundNumber, seat, order };
+  const key = playWallStoreKey(room);
+  if (!key) return;
+  try {
+    sessionStorage.setItem(key, JSON.stringify({
+      roundNumber: game.roundNumber,
+      seat,
+      order,
+    }));
+  } catch {
+    // 忽略隐私模式等存储不可用的情况
+  }
+}
+
+function playWallBreakFromServer(game) {
+  const breakInfo = game?.wallBreak;
+  if (!breakInfo?.dice) return null;
+  const side = openingBreakSide(breakInfo, game.dealerSeat, game.you.seat);
+  if (!side) return null;
+  return (OPENING_WALL_CLOCKWISE_START[side] + breakInfo.dice) % OPENING_WALL_TOTAL_STACKS;
+}
 const OPENING_WALL_CLOCKWISE_START = (() => {
   const starts = {};
   let offset = 0;
@@ -1012,9 +1262,9 @@ function openingStats(game) {
   const sorted = Boolean(opening.sortAt) && now >= opening.sortAt;
   const allDealt = events.length > 0 && revealed === events.length;
   const wallBase = opening.wallStart ?? (events.length + game.wallLeft);
-  const wallLeft = started
+  const wallLeft = (started
     ? Math.max(game.wallLeft, wallBase - revealed)
-    : game.wallLeft;
+    : game.wallLeft) + (indicatorRevealed ? 0 : 1);
   return {
     now,
     events,
@@ -1108,19 +1358,13 @@ function renderOpening(room, game) {
     <main class="opening-stage">
       ${offlineBanner()}
       <div class="opening-machine${dealing ? ' is-dealing' : ''}${rolling ? ' is-rolling' : ''}">
-        ${podSeats.map(([position, seat]) => renderOpeningPod(position, playerAt(players, seat), {
-          dealerSeat,
-          viewerSeat,
-          stats,
-          rolling,
-        })).join('')}
         <div class="machine-rim">
           <span class="rim-screw rim-screw--tl" aria-hidden="true"></span>
           <span class="rim-screw rim-screw--tr" aria-hidden="true"></span>
           <span class="rim-screw rim-screw--bl" aria-hidden="true"></span>
           <span class="rim-screw rim-screw--br" aria-hidden="true"></span>
           <div class="machine-felt">
-            <span class="machine-mark" aria-hidden="true">合</span>
+            <span class="machine-mark" aria-hidden="true">牛</span>
             <div class="machine-wall-ring" aria-hidden="true">
               ${Object.keys(OPENING_WALL_SIDES).map((side) => renderOpeningWall(side, stats, breakSide, game)).join('')}
             </div>
@@ -1140,32 +1384,27 @@ function renderOpening(room, game) {
               <div class="machine-readout">${readout}</div>
             </div>
           </div>
+          ${renderOpeningSelfHand(game, players, stats, viewerSeat)}
         </div>
+        ${podSeats.map(([position, seat]) => renderOpeningPod(position, playerAt(players, seat), {
+          dealerSeat,
+          viewerSeat,
+        })).join('')}
       </div>
     </main>
-    ${orientationOverlay()}
   </div>`;
 }
 
 function renderOpeningPod(position, player, options) {
   if (!player) return '';
-  const { dealerSeat, viewerSeat, stats, rolling } = options;
+  const { dealerSeat, viewerSeat } = options;
   const isDealer = player.seat === dealerSeat;
   const isYou = player.seat === viewerSeat;
-  let status;
-  if (!stats.started) {
-    status = `${player.wind}位 · ${isDealer ? '待掷骰' : '等开牌'}`;
-  } else if (rolling) {
-    status = `${player.wind}位 · 掷骰中`;
-  } else {
-    const count = stats.sorted ? player.handCount : (stats.counts[player.seat] || 0);
-    status = `${player.wind}位 · ${count} 张`;
-  }
   return `<div class="machine-pod machine-pod--${position}${isDealer ? ' is-dealer' : ''}${isYou ? ' is-you' : ''}" data-opening-pod="${player.seat}">
     <span class="pod-avatar">${avatarHTML(player.avatar, { className: 'pod-avatar-svg' })}</span>
     <span class="pod-copy">
-      <b>${escapeHTML(player.name)}${isYou ? '<i class="you-mark">你</i>' : ''}</b>
-      <small data-pod-status>${status}</small>
+      <b><span class="seat-name">${escapeHTML(player.name)}</span>${isYou ? '<i class="you-mark">你</i>' : ''}</b>
+      <small class="pod-score">${fundsText(player.score)}</small>
     </span>
     ${isDealer ? '<span class="pod-dealer">庄</span>' : ''}
   </div>`;
@@ -1188,34 +1427,37 @@ function renderDieFace(value) {
 }
 
 function renderOpeningHands(game, players, stats, viewerSeat) {
-  const viewer = game.you;
-  return ['bottom', 'right', 'top', 'left'].map((position, offset) => {
-    const seat = (viewerSeat + offset) % 4;
+  return ['right', 'top', 'left'].map((position, offset) => {
+    const seat = (viewerSeat + offset + 1) % 4;
     const player = playerAt(players, seat);
     if (!player) return '';
     const side = position === 'left' || position === 'right';
-    let content = '';
-    if (seat === viewerSeat) {
-      const revealCount = stats.sorted ? viewer.hand.length : (stats.counts[seat] || 0);
-      const tiles = stats.sorted
-        ? viewer.hand
-        : (game.opening.myDeal || []).slice(0, revealCount);
-      const laiziKey = stats.indicatorRevealed ? game.laizi?.key : null;
-      content = tiles.map((tile) => renderTile(tile, {
-        size: 'opening',
-        tileId: tile.id,
-        laiziKey,
-      })).join('');
-    } else {
-      const count = stats.sorted ? player.handCount : (stats.counts[seat] || 0);
-      content = Array.from({ length: Math.min(count, 14) }, () => (
-        renderBack({ size: side ? 'opening-side' : 'opening' })
-      )).join('');
-    }
-    return `<div class="opening-hand opening-hand--${position}${seat === viewerSeat ? ' is-self' : ''}" data-opening-hand="${seat}" aria-label="${seat === viewerSeat ? '你的手牌' : `${escapeHTML(player.name)}的手牌`}">
+    const count = stats.sorted ? player.handCount : (stats.counts[seat] || 0);
+    const content = Array.from({ length: Math.min(count, 14) }, () => (
+      renderBack({ size: side ? 'opening-side' : 'opening' })
+    )).join('');
+    return `<div class="opening-hand opening-hand--${position}" data-opening-hand="${seat}" aria-label="${escapeHTML(player.name)}的手牌">
       ${content}
     </div>`;
   }).join('');
+}
+
+function renderOpeningSelfHand(game, players, stats, viewerSeat) {
+  const viewer = game.you;
+  if (!playerAt(players, viewerSeat)) return '';
+  const revealCount = stats.sorted ? viewer.hand.length : (stats.counts[viewerSeat] || 0);
+  const tiles = stats.sorted
+    ? viewer.hand
+    : (game.opening.myDeal || []).slice(0, revealCount);
+  const laiziKey = stats.indicatorRevealed ? game.laizi?.key : null;
+  const content = tiles.map((tile) => renderTile(tile, {
+    size: 'opening',
+    tileId: tile.id,
+    laiziKey,
+  })).join('');
+  return `<div class="opening-hand opening-hand--bottom is-self" data-opening-hand="${viewerSeat}" aria-label="你的手牌">
+    ${content}
+  </div>`;
 }
 
 function renderOpeningIndicator(game, stats) {
@@ -1232,7 +1474,7 @@ function renderOpeningIndicator(game, stats) {
 function renderOpeningWall(side, stats, breakSide, game) {
   const total = OPENING_WALL_SIDES[side];
   const active = Boolean(breakSide === side && stats.started && !stats.indicatorRevealed);
-  const breakOrder = openingWallBreakOrder(game);
+  const breakOrder = openingWallBreakOrder(game) ?? playWallBreakFromServer(game) ?? 0;
   const removed = openingWallTakenCount(stats.wallLeft);
   const stacks = [];
   for (let index = 0; index < total; index += 1) {
@@ -1242,6 +1484,15 @@ function renderOpeningWall(side, stats, breakSide, game) {
   }
   return `<div class="machine-wall machine-wall--${side}${active ? ' is-active' : ''}" aria-hidden="true">
     ${stacks.join('')}
+  </div>`;
+}
+
+function renderPlayWall(game) {
+  const stats = { wallLeft: game.wallLeft, started: false };
+  const markup = Object.keys(OPENING_WALL_SIDES)
+    .map((side) => renderOpeningWall(side, stats, null, game));
+  return `<div class="game-wall" aria-hidden="true">
+    <div class="machine-wall-ring">${markup.join('')}</div>
   </div>`;
 }
 
@@ -1316,14 +1567,7 @@ function revealOpeningEvent(key, event, index) {
     }));
   }
 
-  const status = document.querySelector(`[data-opening-pod="${event.seat}"] [data-pod-status]`);
-  if (status) {
-    const wind = game.players[event.seat]?.wind || '';
-    status.textContent = `${wind}位 · ${event.count} 张`;
-  }
-
-  const wallLeft = Math.max(game.wallLeft, (opening.wallStart || 0) - (index + 1));
-  updateOpeningWall(wallLeft);
+  updateOpeningWall(openingStats(game).wallLeft);
   const progress = document.querySelector('[data-opening-progress] span');
   if (progress) {
     const percent = opening.dealEvents.length
@@ -1364,6 +1608,7 @@ function showOpeningIndicator(key) {
 function flipOpeningIndicator(key) {
   if (!openingStillActive(key)) return;
   const game = state.room.game;
+  updateOpeningWall(openingStats(game).wallLeft);
   const slot = document.querySelector('[data-opening-indicator]');
   if (slot) {
     slot.classList.add('is-shown', 'is-revealed');
@@ -1456,21 +1701,23 @@ function runOpeningSort(key) {
 }
 
 function orientationOverlay() {
-  if (state.orientationDismissed || !isMobileDevice() || !isPortrait()) return '';
+  if (!isMobileDevice() || !isPortrait()) return '';
+  const auto = supportsAutoLandscape();
   return `<div class="rotate-overlay" role="dialog" aria-modal="true" aria-labelledby="rotate-title">
     <div class="rotate-card">
       <div class="rotate-glyph" aria-hidden="true"><span>${ICON.rotate}</span></div>
       <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>横屏牌桌</p>
       <h2 id="rotate-title">把手机横过来</h2>
-      <p>横屏之后，手牌、牌河和操作按钮都会更顺手。支持自动横屏的手机可以直接进入。</p>
-      <button type="button" class="button button--primary button--wide" data-action="enter-landscape">进入横屏</button>
-      <button type="button" class="text-button text-button--quiet" data-action="dismiss-rotate">先用竖屏</button>
+      <p>${auto
+    ? '横屏之后，手牌、牌河和操作按钮都会更顺手。支持自动横屏的手机可以直接进入。'
+    : '把手机横过来就会切换到横屏布局，牌桌会固定大小，避免误触。'}</p>
+      ${auto ? '<button type="button" class="button button--primary button--wide" data-action="enter-landscape">进入横屏</button>' : ''}
+      <p class="rotate-required">请先横放手机再继续；若画面未旋转，请关闭系统的竖排方向锁定。</p>
     </div>
   </div>`;
 }
 
 function renderGameHeader(room, game, viewerSeat) {
-  const roundText = `第 ${game.roundNumber} 局`;
   const opening = game.phase === 'opening' ? game.opening : null;
   const stats = opening ? openingStats(game) : null;
   const laiziRevealed = !opening || stats.indicatorRevealed;
@@ -1480,13 +1727,12 @@ function renderGameHeader(room, game, viewerSeat) {
     : '牌尾翻出什么，下一张就是赖子';
   return `<header class="game-header">
     <div class="game-header-left">
-      <button type="button" class="icon-button icon-button--dark" data-action="open-menu" aria-label="牌桌菜单">${ICON.back}</button>
-      <div class="game-brand">
-        <span class="game-brand-seal">合</span>
-        <span><b>房间 ${escapeHTML(room.code)}</b><small>${roundText} · 湖北 108 张</small></span>
-      </div>
-    </div>
-    <div class="game-status-chips">
+      <button type="button" class="icon-button icon-button--dark" data-action="ask-leave" aria-label="离开对局">${ICON.back}</button>
+      <div class="game-status-chips">
+      ${opening ? '' : `<div class="chip chip--tail" title="牌尾翻出${tileLabel(game.indicator)}，第四张已亮明">
+        ${renderTile(game.indicator, { size: 'chip' })}
+        <span class="chip-label">尾牌 <b>${tileLabel(game.indicator)}</b></span>
+      </div>`}
       <div class="chip chip--laizi${laiziRevealed ? '' : ' is-concealed'}"${opening ? ' data-opening-laizi' : ''} title="${laiziTitle}">
         <span class="laizi-state laizi-state--veiled">
           ${renderBack({ size: 'chip' })}
@@ -1498,6 +1744,7 @@ function renderGameHeader(room, game, viewerSeat) {
         </span>
       </div>
       <div class="chip chip--wall"><span>余牌</span><b${opening ? ' data-opening-wall' : ''}>${wallLeft}</b></div>
+      </div>
     </div>
     <div class="game-header-right">
       <span class="wind-reminder">你坐 ${game.players[viewerSeat]?.wind || ''} 位</span>
@@ -1512,16 +1759,24 @@ function renderTopOpponent(player, game) {
   if (!player) return '';
   const isTurn = game.phase !== 'ended' && game.turnSeat === player.seat;
   return `<div class="opponent opponent--top${isTurn ? ' is-turn' : ''}">
-    <div class="opponent-identity">
-      <span class="opponent-avatar">${avatarHTML(player.avatar, { className: 'opponent-avatar-svg' })}</span>
-      <span class="opponent-copy">
-        <strong>${escapeHTML(player.name)}<span class="wind-tag">${player.wind}</span>${player.isDealer ? '<span class="dealer-tag">庄</span>' : ''}${player.isHost ? '<span class="host-tag">东家</span>' : ''}</strong>
-        <small>${formatScore(player.score)} 分 · ${player.handCount} 张${player.auto && !player.isBot ? ' · 托管' : ''}</small>
-      </span>
-      <span class="turn-pin">出牌中</span>
-    </div>
     <div class="opponent-hand-backs">${renderHandBacks(player.handCount, 'horizontal')}</div>
-    ${renderMeldStrip(player, 'horizontal', game)}
+    <div class="opponent-melds">${renderMeldStrip(player, 'horizontal', game)}</div>
+    <span class="turn-pin">出牌中</span>
+  </div>`;
+}
+
+// Seat cards live on the rim (outside the felt) and counter-rotate, so they face the viewer flat.
+function renderPlayPod(player, position, game) {
+  if (!player) return '';
+  const isTurn = game.phase !== 'ended' && game.turnSeat === player.seat;
+  return `<div class="machine-pod machine-pod--${position}${player.isDealer ? ' is-dealer' : ''}${isTurn ? ' is-turn' : ''}" data-seat="${player.seat}">
+    <span class="pod-avatar">${avatarHTML(player.avatar, { className: 'pod-avatar-svg' })}</span>
+    <span class="pod-copy">
+      <b><span class="seat-name">${escapeHTML(player.name)}</span><i class="wind-tag">${player.wind}</i>${player.isHost && position === 'top' ? '<i class="host-tag">东家</i>' : ''}</b>
+      <small class="pod-score">${fundsText(player.score)}</small>
+    </span>
+    ${player.isDealer ? '<span class="pod-dealer">庄</span>' : ''}
+    ${player.auto && !player.isBot ? '<span class="auto-tag">托</span>' : ''}
   </div>`;
 }
 
@@ -1529,15 +1784,8 @@ function renderSideOpponent(player, side, game) {
   if (!player) return '';
   const isTurn = game.phase !== 'ended' && game.turnSeat === player.seat;
   return `<div class="opponent opponent--side opponent--${side}${isTurn ? ' is-turn' : ''}">
-    <span class="opponent-avatar">${avatarHTML(player.avatar, { className: 'opponent-avatar-svg' })}</span>
-    <div class="side-person">
-      <strong>${escapeHTML(player.name)}</strong>
-      <span><i class="wind-tag">${player.wind}</i>${player.isDealer ? '<i class="dealer-tag">庄</i>' : ''}</span>
-      <small class="side-score">${formatScore(player.score)}</small>
-      ${player.auto && !player.isBot ? '<span class="auto-tag">托</span>' : ''}
-    </div>
     <div class="opponent-hand-backs opponent-hand-backs--vertical">${renderHandBacks(player.handCount, 'vertical')}</div>
-    ${renderMeldStrip(player, 'vertical', game)}
+    <div class="opponent-melds">${renderMeldStrip(player, 'vertical', game)}</div>
     <span class="turn-pin">出牌中</span>
   </div>`;
 }
@@ -1549,10 +1797,27 @@ function renderHandBacks(count, direction) {
   )).join('');
 }
 
+function chengdiaoTilesOf(player) {
+  return (player?.discards || []).filter((tile) => tile.chengdiao);
+}
+
+function renderChengdiaoMeld(tiles, options = {}) {
+  if (!tiles.length) return '';
+  const size = options.size || 'meld';
+  const label = `惩调 ×${tiles.length}`;
+  return `<span class="meld meld--chengdiao meld--size-${size}" title="${label}" aria-label="${label}">${tiles.map((tile) => renderTile(tile, {
+    size,
+    laiziKey: options.laiziKey,
+  })).join('')}</span>`;
+}
+
 function renderMeldStrip(player, orientation, game) {
-  if (!player.melds || player.melds.length === 0) return '';
+  const melds = player.melds || [];
+  const chengdiao = chengdiaoTilesOf(player);
+  if (melds.length === 0 && chengdiao.length === 0) return '';
   return `<div class="meld-strip meld-strip--${orientation}">
-    ${player.melds.map((meld) => renderMeld(meld, {
+    ${renderChengdiaoMeld(chengdiao, { laiziKey: game.laizi.key })}
+    ${melds.map((meld) => renderMeld(meld, {
       size: 'meld',
       viewerSeat: game.you.seat,
       laiziKey: game.laizi.key,
@@ -1566,21 +1831,24 @@ function renderRiverLane(player, position, game, viewerSeat) {
   const isTurn = game.phase !== 'ended' && game.turnSeat === player.seat && game.phase === 'discard';
   const lastDiscard = game.lastDiscard;
   const highlightLast = lastDiscard && lastDiscard.seat === player.seat;
-  return `<section class="river-lane river-lane--${position}${isSelf ? ' is-self' : ''}${isTurn ? ' is-turn' : ''}">
-    <header class="river-head">
-      <span class="wind-badge">${player.wind}</span>
-      <span class="river-name">${isSelf ? '你' : escapeHTML(player.name)}</span>
-      ${player.isDealer ? '<span class="river-dealer">庄</span>' : ''}
-      <span class="river-turn-label">出牌中</span>
-    </header>
+  const discards = (player.discards || []).filter((tile) => !tile.chengdiao);
+  return `<section class="river-lane river-lane--${position}${isSelf ? ' is-self' : ''}${isTurn ? ' is-turn' : ''}" aria-label="${isSelf ? '你' : escapeHTML(player.name)}的牌河">
     <div class="river-tiles">
-      ${player.discards?.length
-    ? player.discards.map((tile) => renderTile(tile, {
+      ${discards.length
+    ? discards.map((tile, index) => {
+      let row = 0;
+      let column = index;
+      while (column >= 4 + row * 2) {
+        column -= 4 + row * 2;
+        row += 1;
+      }
+      return `<span class="river-slot" style="--river-column:${column};--river-row:${row};--river-columns:${4 + row * 2}">${renderTile(tile, {
       size: 'river',
       laiziKey: game.laizi.key,
       highlight: highlightLast && lastDiscard.tile.id === tile.id,
-    })).join('')
-    : '<span class="river-empty">尚未出牌</span>'}
+    })}</span>`;
+    }).join('')
+    : ''}
     </div>
   </section>`;
 }
@@ -1605,19 +1873,28 @@ function renderPendingNotice(game, players, viewerSeat) {
 function renderSelfIdentity(player, game, you) {
   if (!player) return '';
   const isTurn = game.phase === 'discard' && game.turnSeat === player.seat;
-  return `<div class="self-identity${isTurn ? ' is-turn' : ''}">
+  return `<div class="self-identity${isTurn ? ' is-turn' : ''}" data-seat="${player.seat}">
     <span class="self-avatar">${avatarHTML(player.avatar, { className: 'self-avatar-svg' })}</span>
     <span class="self-copy">
       <strong>${escapeHTML(player.name)}<span class="you-mark">你</span></strong>
-      <small>${player.wind}位 · ${formatScore(player.score)} 分${player.isDealer ? ' · 庄家' : ''}</small>
+      <small>${player.wind}位 · ${fundsText(player.score)}${player.isDealer ? ' · 庄家' : ''}</small>
     </span>
     <span class="self-badges">
       ${you.wildCount > 1 ? `<span class="badge badge--warning">赖子 ${you.wildCount} 张 · 胡不了</span>` : ''}
       ${you.wildCount === 1 ? '<span class="badge badge--soft">手中有赖</span>' : ''}
-      ${you.chengdiaoUsed ? '<span class="badge badge--soft">本局已惩调</span>' : ''}
+      ${you.chengdiaoCount > 0 ? `<span class="badge badge--soft">惩调 ×${2 ** you.chengdiaoCount}</span>` : ''}
       ${player.auto && !player.isBot ? '<span class="badge">托管中</span>' : ''}
     </span>
   </div>`;
+}
+
+function renderTurnClock(game, { quiet = false } = {}) {
+  if (game.phase !== 'discard' || !game.turnDeadline) return '';
+  const duration = game.turnLimitMs || TURN_LIMIT;
+  const seconds = Math.max(0, Math.ceil((game.turnDeadline - serverNow()) / 1000));
+  return `<span class="turn-clock countdown-pill${quiet ? ' turn-clock--quiet' : ''}" data-deadline="${game.turnDeadline}" data-duration="${duration}" data-turn-clock aria-label="出牌倒计时 ${seconds} 秒">
+    <span class="countdown-value">${seconds}</span><span class="countdown-unit">秒</span>
+  </span>`;
 }
 
 function renderDockActions(room, game, actions, selectedTile, isMyTurn) {
@@ -1635,7 +1912,7 @@ function renderDockActions(room, game, actions, selectedTile, isMyTurn) {
       <span class="countdown-pill" data-deadline="${actions.deadline}">
         <span class="countdown-value">10</span><span class="countdown-unit">秒</span>
       </span>
-      ${actions.canPeng ? '<button type="button" class="action-button" data-action="claim" data-choice="peng">碰</button>' : ''}
+      ${actions.canPeng && !actions.canGang ? '<button type="button" class="action-button" data-action="claim" data-choice="peng">碰</button>' : ''}
       ${actions.canGang ? '<button type="button" class="action-button action-button--jade" data-action="claim" data-choice="gang">杠</button>' : ''}
       <button type="button" class="action-button action-button--ghost" data-action="claim" data-choice="pass">过</button>
     </div>`;
@@ -1643,13 +1920,19 @@ function renderDockActions(room, game, actions, selectedTile, isMyTurn) {
 
   if (actions?.kind === 'self' && isMyTurn) {
     const discardLabel = selectedTile ? tileLabel(selectedTile) : '';
+    const selectedLaizi = Boolean(selectedTile && selectedTile.key === game.laizi.key);
+    const canChengSelected = Boolean(selectedLaizi && actions.canChengdiao);
     return `<div class="dock-actions dock-actions--self">
+      ${renderTurnClock(game)}
       ${actions.canWin ? '<button type="button" class="action-button action-button--hu" data-action="declare-win">胡</button>' : ''}
-      ${actions.canChengdiao ? '<button type="button" class="action-button action-button--cheng" data-action="ask-chengdiao">惩调</button>' : ''}
+      ${canChengSelected ? '<button type="button" class="action-button action-button--cheng" data-action="cheng-selected">惩调</button>' : ''}
       ${actions.gangs?.length ? `<button type="button" class="action-button action-button--jade" data-action="open-gangs">${actions.gangs.every((gang) => gang.kind === 'huihui') ? '回回' : '杠'}${actions.gangs.length > 1 ? ` ${actions.gangs.length}` : ''}</button>` : ''}
       ${selectedTile
-    ? `<button type="button" class="action-button action-button--discard" data-action="discard-selected">打出 <small>${discardLabel}</small></button>`
-    : '<span class="action-hint">点一张牌，再点一次打出</span>'}
+    ? (selectedLaizi
+      ? `<span class="action-hint">${canChengSelected ? '赖子不能当普通牌打出，点「惩调」打到牌河并摸牌尾' : '赖子不能打出，先留在手里'}</span>`
+      : `<button type="button" class="action-button action-button--discard" data-action="discard-selected">打出 <small>${discardLabel}</small></button>`)
+    : `<span class="action-hint">点一张牌，再点一次打出</span>`}
+      <span class="turn-warning" data-turn-warning hidden aria-live="polite"></span>
     </div>`;
   }
 
@@ -1664,7 +1947,11 @@ function renderDockActions(room, game, actions, selectedTile, isMyTurn) {
   if (game.phase === 'discard') {
     const turnPlayer = game.players[game.turnSeat];
     const status = isMyTurn ? '轮到你出牌' : `等 ${turnPlayer?.name || ''} 出牌`;
-    return `<div class="dock-actions dock-actions--waiting"><span class="action-status">${escapeHTML(status)}</span></div>`;
+    return `<div class="dock-actions dock-actions--waiting">
+      <span class="action-status">${escapeHTML(status)}</span>
+      ${isMyTurn ? '' : renderTurnClock(game, { quiet: true })}
+      ${isMyTurn ? '<span class="action-hint">超时自动出牌</span>' : ''}
+    </div>`;
   }
   return '<div class="dock-actions"></div>';
 }
@@ -1678,11 +1965,14 @@ function renderWaitingText(game) {
   return `等 ${escapeHTML(names.join('、'))} 应对`;
 }
 
-function renderSelfMelds(you, game) {
-  if (!you.melds?.length) return '';
+function renderSelfMelds(you, game, selfPlayer) {
+  const melds = you.melds || [];
+  const chengdiao = chengdiaoTilesOf(selfPlayer);
+  if (melds.length === 0 && chengdiao.length === 0) return '';
   return `<div class="self-meld-row">
     <span class="self-meld-label">面子</span>
-    ${you.melds.map((meld) => renderMeld(meld, {
+    ${renderChengdiaoMeld(chengdiao, { size: 'meld-self', laiziKey: game.laizi.key })}
+    ${melds.map((meld) => renderMeld(meld, {
     size: 'meld-self',
     viewerSeat: you.seat,
     laiziKey: game.laizi.key,
@@ -1709,8 +1999,39 @@ function renderHand(you, game, actions, isMyTurn, selectedTile) {
     interactive: canInteract,
   })).join('')}
     </div>
-    ${canInteract ? `<span class="hand-tip">${selectedTile ? '再点一次也可以打出' : '点选一张要打出的牌'}</span>` : ''}
+    ${canInteract ? `<span class="hand-tip">${selectedTile
+    ? '再点一次也可以打出'
+    : '点选一张要打出的牌'}</span>` : ''}
   </div>`;
+}
+
+function resultScoreColumns(result) {
+  const gangEvents = (Array.isArray(result.scoreEvents) ? result.scoreEvents : [])
+    .filter((event) => event.type === 'gang');
+  const hasWin = result.type === 'win' && result.winnerSeat !== null && result.winnerSeat !== undefined;
+  const huBySeat = new Map();
+  const gangBySeat = new Map();
+
+  if (hasWin) {
+    const payments = Array.isArray(result.payments) ? result.payments : [];
+    for (const payment of payments) {
+      huBySeat.set(payment.seat, (huBySeat.get(payment.seat) || 0) - (payment.amount || 0));
+    }
+    const total = payments.length
+      ? payments.reduce((sum, payment) => sum + (payment.amount || 0), 0)
+      : (result.total ?? 0);
+    huBySeat.set(result.winnerSeat, (huBySeat.get(result.winnerSeat) || 0) + total);
+  }
+
+  for (const event of gangEvents) {
+    const total = event.total ?? (event.amount || 0) * (event.payers?.length || 0);
+    gangBySeat.set(event.seat, (gangBySeat.get(event.seat) || 0) + total);
+    for (const payer of event.payers || []) {
+      gangBySeat.set(payer, (gangBySeat.get(payer) || 0) - (event.amount || 0));
+    }
+  }
+
+  return { hasWin, hasGang: gangEvents.length > 0, huBySeat, gangBySeat };
 }
 
 function renderResult(room, game, players) {
@@ -1721,12 +2042,12 @@ function renderResult(room, game, players) {
     : null;
   const isHost = room.you?.isHost;
   const winnerCharacter = winner ? getCharacter(winner.avatar) : null;
-  const payments = Array.isArray(result.payments) ? result.payments : [];
-  const winnerChengdiao = Boolean(result.winnerChengdiao ?? result.multiplier > 1);
-  const doubledPayers = payments
-    .filter((payment) => payment.payerChengdiao)
-    .map((payment) => playerAt(players, payment.seat)?.name)
-    .filter(Boolean);
+  const { hasWin, hasGang, huBySeat, gangBySeat } = resultScoreColumns(result);
+  const detailColumns = (hasWin ? 1 : 0) + (hasGang ? 1 : 0);
+  const hasBots = players.some((player) => player.isBot);
+  const settlementNote = hasBots
+    ? '有 AI 参战，本局只作牌桌记录，不改变角色资金。'
+    : '本局结果已存入四家的角色资金。';
 
   return `<div class="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-title">
     <div class="result-card">
@@ -1736,7 +2057,7 @@ function renderResult(room, game, players) {
         ${winner ? `<div class="result-winner">
           <span class="result-avatar">${avatarHTML(winner.avatar, { className: 'result-avatar-svg' })}</span>
           <div>
-            <h2 id="result-title">${escapeHTML(winner.name)} 自摸</h2>
+            <h2 id="result-title">${escapeHTML(winner.name)} 自摸（${result.soft ? '软的' : '黑的'}）</h2>
             <p>${winnerCharacter?.animal || ''} · ${winner.wind}位${winner.isDealer ? ' · 庄家' : ''}</p>
           </div>
         </div>` : `<div class="result-winner result-winner--draw">
@@ -1744,15 +2065,7 @@ function renderResult(room, game, players) {
           <div><h2 id="result-title">本局荒庄</h2><p>牌墙已摸完，四家未胡</p></div>
         </div>`}
       </header>
-      ${winner ? `<div class="result-tags">
-        <span class="result-tag">${result.soft ? '软胡自摸' : '素胡自摸'}</span>
-        <span class="result-tag">${result.soft ? '手中一张赖子' : '不带赖子'}</span>
-        <span class="result-tag result-tag--money">本局收 ${result.total ?? result.perPlayer * 3} 分</span>
-        ${winnerChengdiao ? '<span class="result-tag result-tag--red">惩调 ×2</span>' : ''}
-        ${doubledPayers.length ? `<span class="result-tag result-tag--red">${escapeHTML(doubledPayers.join('、'))} 惩调付双倍</span>` : ''}
-      </div>` : '<p class="result-draw-note">杠分已经结清，牌局照常记录。</p>'}
       ${reveal ? `<div class="result-hand-block">
-        <span class="result-section-label">胡牌牌面</span>
         <div class="result-hand">
           ${(reveal.melds || []).map((meld) => renderMeld(meld, {
     size: 'result-meld',
@@ -1765,19 +2078,28 @@ function renderResult(room, game, players) {
   })).join('')}
         </div>
       </div>` : ''}
-      <div class="result-scores">
-        <div class="result-score-head"><span>四家分数</span><span>本局 / 总计</span></div>
+      <div class="result-scores" data-cols="${detailColumns}">
+        <div class="result-score-head">
+          <span>四家资金</span>
+          ${hasWin ? '<span>胡牌</span>' : ''}
+          ${hasGang ? '<span>杠分</span>' : ''}
+          <span>本局</span>
+          <span>总计</span>
+        </div>
         ${players.map((player) => {
     const delta = result.deltas?.[player.seat] ?? 0;
+    const hu = huBySeat.get(player.seat) ?? 0;
+    const gang = gangBySeat.get(player.seat) ?? 0;
+    const detailCell = (value) => `<span class="result-score-detail${value > 0 ? ' positive' : value < 0 ? ' negative' : ''}">${value ? formatScore(value) : '—'}</span>`;
     return `<div class="result-score-row${player.seat === result.winnerSeat ? ' is-winner' : ''}">
       <span class="result-score-person">
         <span class="tiny-avatar">${avatarHTML(player.avatar, { className: 'tiny-avatar-svg' })}</span>
         <span>${escapeHTML(player.name)}${player.seat === room.viewerSeat ? '<i>你</i>' : ''}</span>
       </span>
-      <span class="result-score-values">
-        <b class="${delta > 0 ? 'positive' : delta < 0 ? 'negative' : ''}">${formatScore(delta)}</b>
-        <em>${formatScore(player.score)}</em>
-      </span>
+      ${hasWin ? detailCell(hu) : ''}
+      ${hasGang ? detailCell(gang) : ''}
+      <b class="result-score-delta${delta > 0 ? ' positive' : delta < 0 ? ' negative' : ''}">${formatScore(delta)}</b>
+      <em class="result-score-total">${player.score}</em>
     </div>`;
   }).join('')}
       </div>
@@ -1787,7 +2109,7 @@ function renderResult(room, game, players) {
     ? `<button type="button" class="button button--primary" data-action="next-round"><span>再来一局</span>${ICON.arrow}</button>`
     : '<button type="button" class="button button--disabled" disabled>等东家开下一局</button>'}
       </div>
-      <p class="result-foot">${isHost ? '胡牌者下局坐庄，荒庄连庄。' : '东家点开下一局后，这里会自动开始。'}</p>
+      <p class="result-foot">${settlementNote}${isHost ? ' 胡牌者下局坐庄，荒庄连庄。' : ' 东家点开下一局后，这里会自动开始。'}</p>
     </div>
   </div>`;
 }
@@ -1805,12 +2127,12 @@ function renderModal() {
     modalRoot.innerHTML = renderMenuModal();
   } else if (type === 'gang') {
     modalRoot.innerHTML = renderGangModal();
-  } else if (type === 'chengdiao') {
-    modalRoot.innerHTML = renderChengdiaoModal();
   } else if (type === 'confirm-leave') {
     modalRoot.innerHTML = renderLeaveConfirm();
   } else if (type === 'share') {
     modalRoot.innerHTML = renderShareModal();
+  } else if (type === 'fullscreen-guide') {
+    modalRoot.innerHTML = renderFullscreenGuide();
   }
   document.body.classList.add('has-modal');
   requestAnimationFrame(() => {
@@ -1832,7 +2154,7 @@ function renderRulesModal() {
   return modalShell(`<div class="modal-body">
     <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>本桌规矩</p>
     <h2 id="modal-title">湖北麻将 · 108 张</h2>
-    <p class="modal-lead">规矩先说好，牌才打得轻松。这里只记积分，不涉及任何现金。</p>
+    <p class="modal-lead">每人开局 1000 元家庭资金，只作家里记分，不涉及任何真实钱款。</p>
     <div class="rule-grid">
       <section class="rule-section">
         <h3><span>一</span>牌与胡法</h3>
@@ -1844,12 +2166,13 @@ function renderRulesModal() {
       </section>
       <section class="rule-section">
         <h3><span>三</span>能碰不能吃</h3>
-        <p>可以碰、可以杠，不能吃上家。顺子全靠自己摸牌，以及赖子来补。碰下的三张牌如果又摸到第四张，可以叫「回回」，三家各付 10 分，并扣下一张摆在面子旁。</p>
+        <p>可以碰、可以杠，不能吃上家。顺子全靠自己摸牌，以及赖子来补。碰下的三张牌如果又摸到第四张，可以叫「回回」，三家各付 10 元，并扣下一张摆在面子旁。</p>
+        <p>牌尾翻出的那张牌已经亮明，杠它时第四张由尾牌补足：暗杠手里有三张即可，别人打出时明杠手里有两张即可，杠后不再补牌。</p>
       </section>
       <section class="rule-section">
         <h3><span>四</span>赖子</h3>
-        <p>开局翻一张牌，同花色下一张的 4 张牌为赖子（如翻出五万，六万作赖；九之后回头一）。赖子可以当任意一张牌用，但不能参与碰、杠，打出后也无人能碰杠。</p>
-        <p class="rule-emphasis">胡牌时手上最多只能有一张赖子。赖子多于一张，只能先打掉多余的。</p>
+        <p>开局翻一张牌，同花色下一张的 4 张牌为赖子（如翻出五万，六万作赖；九之后回头一）。赖子可以当任意一张牌用，但不能参与碰、杠，也不能打出。</p>
+        <p class="rule-emphasis">胡牌时手上最多只能有一张赖子。赖子不能碰、不能杠，也不能当普通弃牌打出；轮到自己摸牌后，点手里的赖子即可惩调：把赖子打到牌河并标记「惩」，再从牌尾摸一张，本局输赢 ×2。可以连续惩，每次打出一张赖子，倍数叠加为 ×4、×8、×16。多出来的赖子也只能这样打出去。</p>
       </section>
       <section class="rule-section">
         <h3><span>五</span>掷骰开牌</h3>
@@ -1859,22 +2182,25 @@ function renderRulesModal() {
     <h3 class="modal-subtitle">算账</h3>
     <div class="score-table">
       <div class="score-table-row score-table-head"><span>胡牌 / 动作</span><span>每位</span><span>说明</span></div>
-      <div class="score-table-row"><span>素胡自摸</span><b>20 分</b><span>不带赖子，共收 60 分</span></div>
-      <div class="score-table-row"><span>软胡自摸</span><b>10 分</b><span>用一张赖子，共收 30 分</span></div>
-      <div class="score-table-row"><span>暗杠</span><b>20 分</b><span>三家各付，共收 60 分</span></div>
-      <div class="score-table-row"><span>回回</span><b>10 分</b><span>碰牌后摸到第四张，三家各付，共收 30 分</span></div>
-      <div class="score-table-row"><span>明杠</span><b>10 分</b><span>由被杠的那一家付</span></div>
-      <div class="score-table-row"><span>惩调</span><b>×2</b><span>本局输赢翻倍，每局每人一次</span></div>
+      <div class="score-table-row"><span>合滴自摸</span><b>20 元</b><span>不用赖子或赖子作本牌，共收 60 元</span></div>
+      <div class="score-table-row"><span>软滴自摸</span><b>10 元</b><span>赖子变作其他牌，共收 30 元</span></div>
+      <div class="score-table-row"><span>暗杠</span><b>20 元</b><span>三家各付，共收 60 元</span></div>
+      <div class="score-table-row"><span>回回</span><b>10 元</b><span>碰牌后摸到第四张，三家各付，共收 30 元</span></div>
+      <div class="score-table-row"><span>明杠</span><b>10 元</b><span>由被杠的那一家付</span></div>
+      <div class="score-table-row"><span>尾牌杠</span><b>10/20 元</b><span>尾牌算第四张，暗杠三张、明杠两张，不补牌</span></div>
+      <div class="score-table-row"><span>惩调</span><b>×2 起</b><span>每次打出一张赖子并从牌尾摸一张，倍数连续叠加</span></div>
     </div>
     <div class="rule-callout">
       <span class="rule-callout-mark">惩调</span>
-      <p><b>听牌后</b>轮到你摸牌时，可以点「惩调」：把刚摸的这张牌与牌墙最末（牌尾）换一张。<b>本局你的输赢都 ×2</b>：你自摸时每家付双倍，别人自摸时你也付双倍。每局每人只能惩调一次。</p>
-      <p>杠或回回后从牌尾补牌本身不算惩调，要翻倍仍需在听牌时主动惩调；若本局已经惩调，之后补牌自摸也照常按双倍结算，杠分和回回分本身不参与翻倍。软胡或窄听去惩调，风险大、收益低。</p>
+      <p><b>惩调只用于赖子。</b>轮到你摸牌后，点手里的赖子并按提示确认，把它打到牌河（标记「惩」），再从牌墙最末（牌尾）摸一张。每次惩调都会让本局倍数翻倍：第一次 ×2，之后 ×4、×8、×16……只要手里还有赖子、牌尾还有牌，就可以连续惩。手里没有赖子时不能惩调。</p>
+      <p><b>结算时倍数是相乘的：</b>例如胡家 ×4、付款家 ×2，该家就按 ×8 付；付款家没惩调则只乘胡家的倍数。杠分和回回分本身不参与翻倍。</p>
+      <p>杠或回回后从牌尾补牌本身不算惩调，但补牌后可以惩调；若本局已经惩调过，之后自摸按累计倍数结算。</p>
     </div>
     <div class="drawer-notes">
+      <p><b>资金：</b>每位角色初始 1000 元，四个座位都是家里人时，本局结果会存进各自角色；有 AI 参战的牌局只作牌桌记录，不改变角色资金。</p>
       <p><b>荒庄：</b>牌墙摸完仍无人胡牌，本局无胡牌分，已经拿到的杠分和回回分保留。</p>
       <p><b>座位：</b>四人一桌；空位由 AI 补位。胡牌者下一局坐庄，荒庄则庄家连庄。</p>
-      <p><b>操作：</b>轮到你时，点选一张牌，再点一次即可打出。别人打牌后，可以碰或杠；应对有 10 秒倒计时。听牌后出现「惩调」按钮，可以赌一次牌尾，本局输赢翻倍。</p>
+      <p><b>操作：</b>轮到你时，点选一张牌，再点一次这张牌即可打出，也可以点「打出」按钮。别人打牌后，可以碰或杠；应对有 10 秒倒计时。赖子不能当普通牌打出，也不能碰、杠；点选赖子后会出现「惩调」按钮，确认后把赖子打到牌河（标记惩）并从牌尾摸一张，可以连续惩，倍数累计 ×2/×4/×8…</p>
     </div>
   </div>`);
 }
@@ -1893,9 +2219,12 @@ function renderMenuModal() {
     <p class="modal-lead">${lead}</p>
     <div class="menu-list">
       <button type="button" class="menu-item" data-action="open-rules">${ICON.rules}<span><b>玩法与算分</b><small>再对一遍本桌规矩</small></span>${ICON.arrow}</button>
+      ${isIOSDevice() && !isStandaloneApp()
+    ? `<button type="button" class="menu-item" data-action="ios-fullscreen">${ICON.rotate}<span><b>全屏游玩</b><small>添加到主屏幕，去掉 Safari 标签栏</small></span>${ICON.arrow}</button>`
+    : ''}
       <button type="button" class="menu-item" data-action="toggle-bgm">${audio.bgmEnabled ? ICON.musicOn : ICON.musicOff}<span><b>背景音乐 · ${audio.bgmEnabled ? '开' : '关'}</b><small>牌桌上的五声音阶小调</small></span>${ICON.arrow}</button>
       <button type="button" class="menu-item" data-action="toggle-sfx">${audio.sfxEnabled ? ICON.soundOn : ICON.soundOff}<span><b>音效与报牌 · ${audio.sfxEnabled ? '开' : '关'}</b><small>牌落桌，湖北话念牌名</small></span>${ICON.arrow}</button>
-      <button type="button" class="menu-item" data-action="share-invite">${ICON.share}<span><b>邀请家里人</b><small>发送房间 ${escapeHTML(room?.code || '')} 的邀请链接</small></span>${ICON.arrow}</button>
+      <button type="button" class="menu-item" data-action="share-invite">${ICON.share}<span><b>邀请家里人</b><small>发送棋牌室链接，直接来这一桌</small></span>${ICON.arrow}</button>
       <button type="button" class="menu-item menu-item--danger" data-action="ask-leave">${ICON.logout}<span><b>离开${room?.game ? '牌局' : '此桌'}</b><small>${room?.game ? '手牌会交给 AI 托管' : '释放你的座位'}</small></span>${ICON.arrow}</button>
     </div>
   </div>`);
@@ -1905,32 +2234,33 @@ function renderGangModal() {
   const actions = state.room?.game?.you?.actions;
   const gangs = actions?.gangs || [];
   const onlyHuihui = gangs.length > 0 && gangs.every((gang) => gang.kind === 'huihui');
+  const onlyTail = gangs.length > 0 && gangs.every((gang) => gang.kind === 'tail');
+  const hasTail = gangs.some((gang) => gang.kind === 'tail');
+  const lead = onlyHuihui
+    ? '碰牌后摸到第四张，可以回回：三家各付 10 元，面子扣下一张，再从牌尾补一张。'
+    : onlyTail
+      ? '尾牌暗杠三家各付 20 元，翻出的尾牌算第四张，杠后不补牌，直接出牌。'
+      : hasTail
+        ? '尾牌暗杠每家付 20 分且不补牌；其余杠或回回后从牌尾补一张。补牌本身不算惩调。'
+        : '杠或回回后从牌尾补一张牌。补牌本身不算惩调，但补完可以惩调；若本局已惩调，之后按累计倍数结算。';
+  const copy = {
+    concealed: { name: '暗杠', note: '手里四张齐全', points: '+60' },
+    tail: { name: '尾牌暗杠', note: '手里三张 · 尾牌补第四张', points: '+60' },
+    huihui: { name: '回回', note: '碰牌后摸到第四张', points: '+30' },
+  };
   return modalShell(`<div class="modal-body">
     <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>${onlyHuihui ? '回回' : '开杠'}</p>
     <h2 id="modal-title">${onlyHuihui ? '要不要回回？' : '选一组杠牌'}</h2>
-    <p class="modal-lead">${onlyHuihui ? '碰牌后摸到第四张，可以回回：三家各付 10 分，面子扣下一张，再从牌尾补一张。' : '杠或回回后从牌尾补一张牌。补牌本身不算惩调；若本局已惩调，仍按双倍结算。'}</p>
+    <p class="modal-lead">${lead}</p>
     <div class="gang-options">
-      ${gangs.map((gang, index) => `<button type="button" class="gang-option" data-action="choose-gang" data-gang-kind="${gang.kind}" data-gang-key="${gang.key}" data-meld-index="${gang.meldIndex ?? ''}" ${index === 0 ? 'data-autofocus' : ''}>
+      ${gangs.map((gang, index) => {
+        const item = copy[gang.kind] || { name: '杠牌', note: '', points: '' };
+        return `<button type="button" class="gang-option" data-action="choose-gang" data-gang-kind="${gang.kind}" data-gang-key="${gang.key}" data-meld-index="${gang.meldIndex ?? ''}" ${index === 0 ? 'data-autofocus' : ''}>
         <span class="gang-tile">${renderTile(gang.tiles[0], { size: 'gang', laiziKey: state.room.game.laizi.key })}</span>
-        <span class="gang-copy"><b>${gang.kind === 'concealed' ? '暗杠' : '回回'}</b><small>${gang.kind === 'concealed' ? '手里四张齐全' : '碰牌后摸到第四张'}</small></span>
-        <span class="gang-points">${gang.kind === 'concealed' ? '+60' : '+30'} 分</span>
-      </button>`).join('')}
-    </div>
-  </div>`);
-}
-
-function renderChengdiaoModal() {
-  return modalShell(`<div class="modal-body">
-    <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>惩调</p>
-    <h2 id="modal-title">要不要换牌尾那张？</h2>
-    <p class="modal-lead">你已听牌。确认后，刚摸的这张牌会换成牌墙最末（牌尾）的一张。<b>本局你的输赢都 ×2</b>：之后自摸每家付双倍，别人自摸你也付双倍。</p>
-    <div class="rule-callout">
-      <span class="rule-callout-mark">提醒</span>
-      <p>素胡翻倍是 40/家，软胡翻倍是 20/家；如果别人先自摸，你也要付双倍。换来的牌没胡也能继续打，本局之后自摸仍然翻倍；每局只能惩调一次，宽面听时更值得试。</p>
-    </div>
-    <div class="confirm-actions">
-      <button type="button" class="button button--ghost" data-action="close-modal" data-autofocus>先不惩调</button>
-      <button type="button" class="button button--primary" data-action="confirm-chengdiao">确认惩调</button>
+        <span class="gang-copy"><b>${item.name}</b><small>${item.note}</small></span>
+        <span class="gang-points">${item.points} 元</span>
+      </button>`;
+      }).join('')}
     </div>
   </div>`);
 }
@@ -1958,19 +2288,39 @@ function renderShareModal() {
     <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>邀请家里人</p>
     <h2 id="modal-title">把牌桌发到微信</h2>
     <p class="modal-lead">${share.copied === false
-    ? '复制没有成功。长按下面的链接复制下来，再发给家里人。'
+    ? '复制没有成功。长按下面的链接复制下来，再打开微信粘贴发送。'
     : wechat
-      ? '邀请链接已经复制。点右上角 ···，选「发送给朋友」，家里人点开就直接入座。'
-      : '邀请链接已经复制。打开微信，粘贴到家庭群，家里人点开就直接入座。'}</p>
+      ? '邀请链接已经复制。粘贴到微信聊天发送，或点右上角 ···，选「发送给朋友」。'
+      : '邀请链接已经复制，正在尝试打开微信。进入家庭群粘贴发送即可；若未跳转，请点「打开微信」或手动打开。'}</p>
     <div class="share-link-field">
-      <span>邀请链接</span>
-      <input class="share-link-input" type="text" readonly value="${escapeHTML(url)}" aria-label="邀请链接">
+      <span>邀请文案与链接</span>
+      <textarea class="share-link-input" rows="4" readonly aria-label="邀请文案与链接">${escapeHTML(share.text || url)}</textarea>
     </div>
     <div class="confirm-actions">
       <button type="button" class="button button--ghost" data-action="close-modal" data-autofocus>知道了</button>
       <button type="button" class="button button--primary" data-action="copy-invite">再复制一次</button>
+      ${!wechat && share.copied === true ? '<a class="button button--primary" href="weixin://">打开微信</a>' : ''}
     </div>
-    <p class="share-tip">微信里也可以直接点右上角 ··· → 发送给朋友，当前这桌的链接会自动带上。</p>
+    <p class="share-tip">网页无法直接选择微信好友；打开微信后需自行粘贴发送。浏览器可能拦截跳转，不会自动发送消息。</p>
+  </div>`);
+}
+
+function renderFullscreenGuide() {
+  const wechat = isWeChatBrowser();
+  return modalShell(`<div class="modal-body">
+    <p class="eyebrow eyebrow--dark"><span class="eyebrow-line"></span>全屏游玩</p>
+    <h2 id="modal-title">把牌桌放到主屏幕</h2>
+    <p class="modal-lead">Safari 不能隐藏标签栏和地址栏。把牌桌添加到主屏幕后，从桌面图标打开会以独立窗口运行，横屏时就是整屏牌桌。</p>
+    ${wechat ? '<div class="rule-callout"><span class="rule-callout-mark">先出微信</span><p>现在在微信里，先点右上角 ···，选「在 Safari 中打开」，再按下面的步骤添加。</p></div>' : ''}
+    <ol class="fullscreen-steps">
+      <li><b>点 Safari 的分享按钮</b><span>就是工具栏上的方框加向上箭头。</span></li>
+      <li><b>选「添加到主屏幕」</b><span>名称保持「牛牛棋牌」，点右上角「添加」。</span></li>
+      <li><b>回桌面点「牛牛棋牌」图标</b><span>以后都从这里进，横屏就不会再有浏览器标签页。</span></li>
+    </ol>
+    <div class="rule-callout"><span class="rule-callout-mark">注意</span><p>主屏幕窗口和 Safari 是两套独立页面，当前这局带不过去。建议先打完这一局，再从桌面窗口回到这桌入座。</p></div>
+    <div class="confirm-actions">
+      <button type="button" class="button button--ghost" data-action="close-modal" data-autofocus>知道了</button>
+    </div>
   </div>`);
 }
 
@@ -1978,40 +2328,40 @@ function updateDocumentTitle() {
   if (state.screen === 'home') {
     if (state.invite) {
       const inviter = state.invite.from || '家里人';
-      document.title = `${inviter}邀你来打牌 · 合院棋牌室`;
+      document.title = `${inviter}邀你来打牌 · 牛牛棋牌室`;
     } else {
-      document.title = '合院棋牌室 · 湖北麻将 108 张';
+      document.title = '牛牛棋牌室';
     }
     return;
   }
   if (state.screen === 'room') {
-    document.title = `房间 ${state.room?.code || ''} · 合院棋牌室`;
+    document.title = '家里人的一桌牌 · 牛牛棋牌室';
     return;
   }
   if (state.screen === 'game') {
     const game = state.room?.game;
     if (!game) {
-      document.title = '合院棋牌室';
+      document.title = '牛牛棋牌室';
       return;
     }
     if (game.phase === 'ended') {
-      document.title = '本局结束 · 合院棋牌室';
+      document.title = '本局结束 · 牛牛棋牌室';
     } else if (game.phase === 'opening') {
       document.title = game.you?.seat === game.dealerSeat && game.opening?.stage === 'waiting'
-        ? '该你掷骰子 · 合院棋牌室'
-        : '开局掷骰 · 合院棋牌室';
+        ? '该你掷骰子 · 牛牛棋牌室'
+        : '开局掷骰 · 牛牛棋牌室';
     } else if (game.you?.actions?.kind === 'claim') {
-      document.title = '该你应对 · 合院棋牌室';
+      document.title = '该你应对 · 牛牛棋牌室';
     } else if (game.phase === 'discard' && game.turnSeat === game.you?.seat) {
-      document.title = '轮到你出牌 · 合院棋牌室';
+      document.title = '轮到你出牌 · 牛牛棋牌室';
     } else {
-      document.title = '牌局进行中 · 合院棋牌室';
+      document.title = '牌局进行中 · 牛牛棋牌室';
     }
   }
 }
 
 function tickCountdowns() {
-  const now = Date.now();
+  const now = serverNow();
   document.querySelectorAll('[data-deadline]').forEach((element) => {
     const deadline = Number(element.dataset.deadline);
     if (!Number.isFinite(deadline)) return;
@@ -2019,21 +2369,46 @@ function tickCountdowns() {
     const seconds = Math.ceil(remaining / 1000);
     if (element.classList.contains('pending-countdown')) {
       element.textContent = `${seconds}s`;
-    } else if (element.classList.contains('countdown-pill')) {
-      const value = element.querySelector('.countdown-value');
-      if (value) value.textContent = String(seconds);
-      element.style.setProperty('--countdown', `${Math.min(100, (remaining / CLAIM_WINDOW) * 100)}%`);
+      return;
     }
+    if (!element.classList.contains('countdown-pill')) return;
+    const value = element.querySelector('.countdown-value');
+    if (value) value.textContent = String(seconds);
+    if (element.classList.contains('turn-clock')) {
+      const duration = Number(element.dataset.duration) || TURN_LIMIT;
+      element.style.setProperty('--countdown', `${Math.min(100, (remaining / duration) * 100)}%`);
+      const urgent = remaining <= 10000;
+      element.classList.toggle('is-urgent', urgent);
+      const warning = element.closest('.dock-actions')?.querySelector('[data-turn-warning]');
+      if (warning) {
+        const wasHidden = warning.hidden;
+        warning.hidden = !urgent;
+        if (urgent) warning.textContent = `${seconds} 秒后自动打出一张`;
+        if (wasHidden !== warning.hidden) syncDockHeight();
+        if (!warning.hidden && turnWarningDeadline !== element.dataset.deadline) {
+          turnWarningDeadline = element.dataset.deadline;
+          audio.play('select');
+        }
+      }
+      return;
+    }
+    element.style.setProperty('--countdown', `${Math.min(100, (remaining / CLAIM_WINDOW) * 100)}%`);
   });
 }
 
 window.setInterval(tickCountdowns, 120);
 
 function handleOrientationChange() {
-  if (state.screen === 'game' || state.screen === 'room') render();
+  render();
 }
 
 window.addEventListener('orientationchange', handleOrientationChange);
+window.addEventListener('resize', () => {
+  if (state.screen === 'game') {
+    syncTableSize();
+    syncDockHeight();
+  }
+});
 const orientationQuery = window.matchMedia?.('(orientation: portrait)');
 if (orientationQuery) {
   if (orientationQuery.addEventListener) orientationQuery.addEventListener('change', handleOrientationChange);
@@ -2059,13 +2434,24 @@ function handleHandTile(tileId) {
   if (!actions || actions.kind !== 'self') return;
   if (game.phase === 'ended') return;
   if (state.selectedTileId === tileId) {
-    discardTile(tileId);
+    requestDiscard(tileId);
     return;
   }
   state.selectedTileId = tileId;
   audio.unlock();
   audio.play('select');
   render();
+}
+
+function requestDiscard(tileId) {
+  const game = state.room?.game;
+  const tile = game?.you?.hand?.find((item) => item.id === tileId);
+  if (!game || !tile) return;
+  if (tile.key === game.laizi.key) {
+    declareChengdiao(tileId);
+    return;
+  }
+  discardTile(tileId);
 }
 
 async function discardTile(tileId) {
@@ -2106,8 +2492,12 @@ async function declareWin() {
   if (!response.ok) render();
 }
 
-async function declareChengdiao() {
-  const response = await request('game:action', { action: { type: 'chengdiao' } });
+async function declareChengdiao(tileId) {
+  if (!tileId || state.actionInFlight) return;
+  state.selectedTileId = null;
+  const response = await request('game:action', {
+    action: { type: 'chengdiao', tileId },
+  });
   if (!response.ok) render();
 }
 
@@ -2157,6 +2547,7 @@ function resetToHome() {
   exitLandscapeMode();
   renderModal();
   render();
+  loadBalances(true);
 }
 
 function markIdentityRemembered() {
@@ -2190,30 +2581,7 @@ function confirmIdentityEdit() {
 async function createRoom() {
   if (state.actionInFlight) return;
   markIdentityRemembered();
-  const response = await request('room:create', {
-    profile: {
-      name: effectiveName(),
-      avatar: state.profile.avatar,
-    },
-  });
-  if (response.ok) {
-    sessionStorage.setItem(ROOM_STORAGE, response.code);
-    audio.play('join');
-  } else {
-    render();
-  }
-}
-
-async function joinRoom() {
-  if (state.actionInFlight) return;
-  const code = state.invite?.code;
-  if (!code) {
-    showToast('邀请链接不完整，请让家里人重新发一次', 'error');
-    return;
-  }
-  markIdentityRemembered();
   const response = await request('room:join', {
-    code,
     profile: {
       name: effectiveName(),
       avatar: state.profile.avatar,
@@ -2240,26 +2608,22 @@ async function shareInvite() {
   if (!code) return;
   const inviter = effectiveName();
   const url = buildInviteUrl(code, inviter);
-  const shareData = {
-    title: `合院棋牌室 · 房间 ${code}`,
-    text: `${inviter} 邀你来「合院棋牌室」打湖北麻将，房间 ${code}。点开链接直接入座。`,
-    url,
-  };
-  if (navigator.share && isMobileDevice() && !isWeChatBrowser()) {
-    try {
-      await navigator.share(shareData);
-      return;
-    } catch (error) {
-      if (error?.name === 'AbortError') return;
-    }
-  }
-  const copied = await copyText(url);
-  state.modal = { type: 'share', url, copied, wechat: isWeChatBrowser() };
+  const text = `${inviter}邀请你加入麻将对局，一起摸两圈！点击链接，马上入座：\n${url}`;
+  const copied = await copyText(text);
+  const wechat = isWeChatBrowser();
+  state.modal = { type: 'share', url, text, copied, wechat };
   renderModal();
   showToast(
     copied ? '邀请链接已复制' : '链接已备好，长按可复制',
     copied ? 'success' : 'info',
   );
+  if (copied && !wechat) {
+    try {
+      window.location.href = 'weixin://';
+    } catch (error) {
+      // Keep the copied link and manual launch option when navigation is blocked.
+    }
+  }
 }
 
 async function copyInviteLink() {
@@ -2267,7 +2631,10 @@ async function copyInviteLink() {
   const url = state.modal?.type === 'share' && state.modal.url
     ? state.modal.url
     : buildInviteUrl(state.room.code, effectiveName());
-  const copied = await copyText(url);
+  const text = state.modal?.type === 'share' && state.modal.text
+    ? state.modal.text
+    : `${effectiveName()}邀请你加入麻将对局，一起摸两圈！点击链接，马上入座：\n${url}`;
+  const copied = await copyText(text);
   if (copied && state.modal?.type === 'share') {
     state.modal.copied = true;
     renderModal();
@@ -2280,6 +2647,12 @@ async function copyInviteLink() {
 
 async function requestLandscapeMode() {
   if (!isMobileDevice()) return false;
+  if (!supportsAutoLandscape()) {
+    state.orientationDismissed = true;
+    render();
+    showToast('把手机横过来，就能用横屏牌桌了', 'info');
+    return false;
+  }
   const root = document.documentElement;
   let locked = false;
   try {
@@ -2361,11 +2734,10 @@ async function takeSeat(seat) {
 }
 
 async function startGame() {
-  const rotate = isMobileDevice() && isPortrait();
-  if (rotate) requestLandscapeMode();
+  // Rotation stays manual via the rotate prompt instead of forcing fullscreen and an
+  // orientation lock, so iPhone Safari keeps its native browser behaviour.
   const response = await request('room:start', {});
-  if (!response.ok && rotate) exitLandscapeMode();
-  else if (response.ok) render();
+  if (response.ok) render();
 }
 
 async function nextRound() {
@@ -2377,8 +2749,60 @@ async function nextRound() {
   }
 }
 
+const tapGuard = { multiTouch: false, moved: false, startX: 0, startY: 0, suppressUntil: 0 };
+
+document.addEventListener('touchstart', (event) => {
+  if (tapGuard.multiTouch) return;
+  if (event.touches.length > 1) {
+    tapGuard.multiTouch = true;
+    return;
+  }
+  const touch = event.touches[0];
+  if (!touch) return;
+  tapGuard.startX = touch.clientX;
+  tapGuard.startY = touch.clientY;
+  tapGuard.moved = false;
+}, { passive: true, capture: true });
+
+document.addEventListener('touchmove', (event) => {
+  if (event.touches.length > 1) {
+    event.preventDefault();
+    tapGuard.multiTouch = true;
+    return;
+  }
+  if (tapGuard.multiTouch) return;
+  const touch = event.touches[0];
+  if (!touch) return;
+  if (Math.hypot(touch.clientX - tapGuard.startX, touch.clientY - tapGuard.startY) > 10) {
+    tapGuard.moved = true;
+  }
+}, { passive: false, capture: true });
+
+// iOS Safari ignores user-scalable=no, so its proprietary gesture events need
+// explicit blocking; the multi-touch touchmove handler above covers other engines.
+for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
+  document.addEventListener(type, (event) => event.preventDefault(), { passive: false });
+}
+
+function endTapGuard(event) {
+  if (event.touches.length) return;
+  const wasGesture = tapGuard.multiTouch || tapGuard.moved;
+  tapGuard.multiTouch = false;
+  tapGuard.moved = false;
+  if (wasGesture) tapGuard.suppressUntil = performance.now() + 450;
+}
+
+document.addEventListener('touchend', endTapGuard, { passive: true, capture: true });
+document.addEventListener('touchcancel', endTapGuard, { passive: true, capture: true });
+
 document.addEventListener('click', (event) => {
+  if (performance.now() < tapGuard.suppressUntil) return;
   audio.unlock();
+  if (!event.target.closest('.danmaku-control')) {
+    const options = appRoot.querySelector('.danmaku-options');
+    if (options) options.hidden = true;
+    appRoot.querySelector('.danmaku-trigger')?.setAttribute('aria-expanded', 'false');
+  }
   const actionTarget = event.target.closest('[data-action]');
   if (!actionTarget) {
     const tile = event.target.closest('[data-tile-id]');
@@ -2387,6 +2811,10 @@ document.addEventListener('click', (event) => {
   }
   const action = actionTarget.dataset.action;
   switch (action) {
+    case 'dismiss-home-screen-hint':
+      state.homeScreenHintDismissed = true;
+      appRoot.querySelector('.home-screen-hint')?.remove();
+      break;
     case 'select-avatar':
       selectAvatar(actionTarget.dataset.avatar);
       break;
@@ -2408,12 +2836,31 @@ document.addEventListener('click', (event) => {
     case 'toggle-sfx':
       toggleSfx();
       break;
+    case 'open-danmaku': {
+      const options = appRoot.querySelector('.danmaku-options');
+      if (options) {
+        options.hidden = !options.hidden;
+        actionTarget.setAttribute('aria-expanded', String(!options.hidden));
+      }
+      break;
+    }
+    case 'send-danmaku': {
+      const phrase = actionTarget.dataset.phrase;
+      appRoot.querySelector('.danmaku-options').hidden = true;
+      appRoot.querySelector('.danmaku-trigger')?.setAttribute('aria-expanded', 'false');
+      request('room:danmaku', { phrase }).catch((error) => showToast(error.message));
+      break;
+    }
     case 'open-rules':
       state.modal = { type: 'rules' };
       renderModal();
       break;
     case 'open-menu':
       state.modal = { type: 'menu' };
+      renderModal();
+      break;
+    case 'ios-fullscreen':
+      state.modal = { type: 'fullscreen-guide' };
       renderModal();
       break;
     case 'close-modal':
@@ -2456,13 +2903,8 @@ document.addEventListener('click', (event) => {
     case 'roll-dice':
       rollDice();
       break;
-    case 'ask-chengdiao':
-      state.modal = { type: 'chengdiao' };
-      renderModal();
-      break;
-    case 'confirm-chengdiao':
-      closeModal();
-      declareChengdiao();
+    case 'cheng-selected':
+      declareChengdiao(state.selectedTileId);
       break;
     case 'open-gangs':
       openGangs();
@@ -2475,7 +2917,7 @@ document.addEventListener('click', (event) => {
       );
       break;
     case 'discard-selected':
-      discardTile(state.selectedTileId);
+      requestDiscard(state.selectedTileId);
       break;
     case 'dismiss-result':
       state.showResult = false;
@@ -2510,8 +2952,7 @@ document.addEventListener('submit', (event) => {
   event.preventDefault();
   if (event.target.id === 'create-form') {
     createRoom();
-  } else if (event.target.id === 'invite-form') {
-    joinRoom();
+
   } else if (event.target.id === 'identity-form') {
     confirmIdentityEdit();
   }
@@ -2531,6 +2972,7 @@ document.addEventListener('keydown', (event) => {
 });
 
 modalRoot.addEventListener('click', (event) => {
+  if (performance.now() < tapGuard.suppressUntil) return;
   if (event.target.classList.contains('modal-backdrop')) closeModal();
 });
 

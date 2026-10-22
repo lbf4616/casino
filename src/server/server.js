@@ -4,7 +4,8 @@ const http = require('http');
 const path = require('path');
 const express = require('express');
 const { Server } = require('socket.io');
-const { RoomManager } = require('./room');
+const { RoomManager, AVATARS } = require('./room');
+const { INITIAL_BALANCE } = require('./scores');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -28,6 +29,13 @@ const io = new Server(server, {
   pingTimeout: 20000,
 });
 const manager = new RoomManager(io);
+const { Danmaku } = require('./danmaku');
+const danmaku = new Danmaku();
+
+app.get('/api/scores', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ initial: INITIAL_BALANCE, scores: manager.balances.all(AVATARS) });
+});
 
 function sendAck(ack, payload) {
   if (typeof ack === 'function') ack(payload);
@@ -46,6 +54,10 @@ io.on('connection', (socket) => {
     return;
   }
   socket.data.clientId = clientId;
+  socket.use((packet, next) => {
+    if (!socket.data.replaced) return next();
+    sendAck(packet[packet.length - 1], { ok: false, error: '角色已在其他设备登录' });
+  });
 
   socket.on('room:create', (payload, ack) => {
     try {
@@ -110,6 +122,20 @@ io.on('connection', (socket) => {
   socket.on('room:leave', (payload, ack) => {
     try {
       manager.leave(clientId);
+      sendAck(ack, { ok: true });
+    } catch (error) {
+      failAck(ack, error);
+    }
+  });
+
+  socket.on('room:danmaku', (payload, ack) => {
+    try {
+      const room = manager.getRoomForClient(clientId);
+      if (!room) throw new Error('你不在房间里');
+      const message = danmaku.send(room, clientId, payload?.phrase);
+      for (const player of room.connectedHumans()) {
+        io.sockets.sockets.get(player.socketId)?.emit('room:danmaku', message);
+      }
       sendAck(ack, { ok: true });
     } catch (error) {
       failAck(ack, error);

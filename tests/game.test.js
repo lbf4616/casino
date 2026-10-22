@@ -47,6 +47,25 @@ function freshGame() {
   return game;
 }
 
+test('日志达到保留上限后 ID 仍唯一递增，不会重复触发旧的碰杠惩播报', () => {
+  const game = freshGame();
+  const ids = new Set(game.log.map((entry) => entry.id));
+  for (let index = 0; index < 120; index += 1) {
+    const previousId = game.log.at(-1).id;
+    const kind = index === 80 ? 'peng' : index === 81 ? 'gang' : index === 82 ? 'chengdiao' : 'discard';
+    const discarded = tile('wan', index % 9 + 1);
+    game.addLog(kind, '报牌测试', 0, discarded);
+    const latest = game.log.at(-1);
+    assert.equal(ids.has(latest.id), false);
+    ids.add(latest.id);
+    const previousIndex = game.log.findIndex((entry) => entry.id === previousId);
+    assert.ok(previousIndex >= 0);
+    assert.deepEqual(game.log.slice(previousIndex + 1), [latest]);
+    assert.ok(game.log.length <= 80);
+    assert.deepEqual(game.viewFor(0).log.at(-1), latest);
+  }
+});
+
 test('开局先等庄家掷骰子，掷完每人十三张，庄家十四张，牌墙数量正确', () => {
   const game = new Game({ actors: actors(), scores: [0, 0, 0, 0], dealerSeat: 0 });
   assert.equal(game.phase, 'opening');
@@ -191,12 +210,12 @@ test('碰牌后由碰牌者出牌，且不能直接胡', () => {
 test('出牌日志保留牌面信息，供客户端播报', () => {
   const game = freshGame();
   game.players[0].hand = tiles([['tong', 1], ['wan', 2], ['wan', 3]]);
-  const discard = game.players[0].hand.find((entry) => entry.key === 'tong-1');
+  const discard = game.players[0].hand.find((entry) => entry.key === 'wan-2');
   game.discard(0, discard.id);
   const log = game.log.findLast((entry) => entry.kind === 'discard');
   assert.equal(game.lastDiscard, null);
   assert.equal(log.seat, 0);
-  assert.deepEqual(log.tile, { id: discard.id, suit: 'tong', rank: 1, key: 'tong-1' });
+  assert.deepEqual(log.tile, { id: discard.id, suit: 'wan', rank: 2, key: 'wan-2' });
 });
 
 test('明杠由点杠者付十分，并从牌尾补牌', () => {
@@ -225,7 +244,7 @@ test('明杠由点杠者付十分，并从牌尾补牌', () => {
   assert.equal(game.turnSeat, 1);
   assert.equal(game.phase, 'discard');
   assert.equal(game.lastDrawFromTail, true);
-  assert.equal(game.players[1].chengdiaoUsed, false);
+  assert.equal(game.players[1].chengdiaoCount, 0);
   assert.equal(game.wall.length, wallBefore - 1);
 });
 
@@ -265,62 +284,69 @@ test('软胡自摸每家十分，牌尾补牌本身不翻倍', () => {
   assert.deepEqual(game.scores, [30, -10, -10, -10]);
 });
 
-test('听牌后惩调，换到牌尾的牌自摸翻倍，且每局只能一次', () => {
+test('惩调赖子后自摸翻倍', () => {
   const game = freshGame();
-  const baseHand = tiles([
+  const natural = tiles([
     ['wan', 4], ['wan', 5], ['wan', 6],
     ['tiao', 2], ['tiao', 3], ['tiao', 4],
     ['tong', 7], ['tong', 8], ['tong', 9],
-    ['wan', 2], ['wan', 3],
     ['tiao', 9, 2],
+    ['wan', 2],
   ]);
-  const drawn = tile('wan', 9);
-  const tail = tile('tong', 1);
-  game.players[0].hand = [...baseHand, drawn];
-  game.lastDrawnId = drawn.id;
+  const [laiziA, laiziB] = tiles([['tong', 1, 2]]);
+  game.players[0].hand = [...natural, laiziA, laiziB];
+  const tail = tile('wan', 3);
+  game.lastDrawnId = laiziB.id;
   game.hasDrawnThisTurn = true;
   game.wall[game.wall.length - 1] = tail;
   const wallBefore = game.wall.length;
 
   assert.equal(game.getActions(0).canChengdiao, true);
-  assert.equal(game.getActions(0).chengdiaoUsed, false);
-  assert.equal(game.canDeclareChengdiao(0), true);
-  game.declareChengdiao(0);
-  assert.equal(game.players[0].chengdiaoUsed, true);
-  assert.equal(game.wall.length, wallBefore);
-  assert.equal(game.wall[game.wall.length - 1].id, drawn.id);
-  assert.equal(game.players[0].hand.some((entry) => entry.id === tail.id), true);
+  assert.equal(game.getActions(0).chengdiaoCount, 0);
+  assert.equal(game.canDeclareWin(0), false);
+
+  game.declareChengdiao(0, laiziA.id);
+  const player = game.players[0];
+  assert.equal(player.chengdiaoCount, 1);
+  assert.equal(player.hand.some((entry) => entry.id === laiziA.id), false);
+  assert.equal(player.discards.at(-1).id, laiziA.id);
+  assert.equal(player.discards.at(-1).chengdiao, true);
+  assert.equal(game.lastDiscard.chengdiao, true);
+  assert.equal(player.hand.filter((entry) => entry.key === 'tong-1').length, 1);
+  assert.equal(player.hand.some((entry) => entry.id === tail.id), true);
+  assert.equal(game.wall.length, wallBefore - 1);
   assert.equal(game.canDeclareChengdiao(0), false);
+  assert.equal(player.discards.at(-1).key, game.laiziKey);
 
   game.declareWin(0);
   assert.equal(game.result.soft, true);
   assert.equal(game.result.multiplier, 2);
   assert.equal(game.result.perPlayer, 20);
-  assert.equal(game.result.reason, '惩调');
+  assert.equal(game.result.reason, '惩调×2');
   assert.deepEqual(game.scores, [60, -20, -20, -20]);
 });
 
 test('惩调后没有立即胡，本局之后自摸仍然翻倍', () => {
   const game = freshGame();
-  const baseHand = tiles([
+  const natural = tiles([
     ['wan', 4], ['wan', 5], ['wan', 6],
     ['tiao', 2], ['tiao', 3], ['tiao', 4],
     ['tong', 7], ['tong', 8], ['tong', 9],
-    ['wan', 2], ['wan', 3],
     ['tiao', 9, 2],
+    ['wan', 2],
   ]);
-  const drawn = tile('wan', 9);
-  const tail = tile('tong', 1);
-  game.players[0].hand = [...baseHand, drawn];
-  game.lastDrawnId = drawn.id;
+  const [laiziA, laiziB] = tiles([['tong', 1, 2]]);
+  game.players[0].hand = [...natural, laiziA, laiziB];
+  const tail = tile('wan', 9);
+  game.lastDrawnId = laiziB.id;
   game.hasDrawnThisTurn = true;
   game.wall[game.wall.length - 1] = tail;
 
-  game.declareChengdiao(0);
-  game.discard(0, tail.id);
-  game.drawFor(0, false);
-  const winning = tile('tong', 1);
-  game.players[0].hand = [...baseHand, winning];
+  game.declareChengdiao(0, laiziA.id);
+  assert.equal(game.canPlayerWin(0), false);
+
+  const winning = tile('wan', 3);
+  game.players[0].hand = [...natural, laiziB, winning];
   game.lastDrawnId = winning.id;
   game.hasDrawnThisTurn = true;
   game.declareWin(0);
@@ -342,7 +368,7 @@ test('别人惩调后自摸，该家付双倍', () => {
     ['wan', 2], ['wan', 3], ['wan', 4],
     ['tiao', 9, 2],
   ]);
-  game.players[1].chengdiaoUsed = true;
+  game.players[1].chengdiaoCount = 1;
   game.hasDrawnThisTurn = true;
   game.lastDrawnId = game.players[0].hand[0].id;
 
@@ -352,14 +378,14 @@ test('别人惩调后自摸，该家付双倍', () => {
   assert.equal(game.result.multiplier, 1);
   assert.equal(game.result.total, 80);
   assert.deepEqual(game.result.payments, [
-    { seat: 1, amount: 40, payerChengdiao: true },
-    { seat: 2, amount: 20, payerChengdiao: false },
-    { seat: 3, amount: 20, payerChengdiao: false },
+    { seat: 1, amount: 40, payerChengdiao: true, payerChengdiaoCount: 1, payerMultiplier: 2, multiplier: 2 },
+    { seat: 2, amount: 20, payerChengdiao: false, payerChengdiaoCount: 0, payerMultiplier: 1, multiplier: 1 },
+    { seat: 3, amount: 20, payerChengdiao: false, payerChengdiaoCount: 0, payerMultiplier: 1, multiplier: 1 },
   ]);
   assert.deepEqual(game.scores, [80, -40, -20, -20]);
 });
 
-test('胡家和付款家都惩调时只翻一次', () => {
+test('胡家和付款家都惩调时倍数相乘', () => {
   const game = freshGame();
   game.players[0].hand = tiles([
     ['wan', 4], ['wan', 5], ['wan', 6],
@@ -368,19 +394,46 @@ test('胡家和付款家都惩调时只翻一次', () => {
     ['wan', 2], ['wan', 3], ['wan', 4],
     ['tiao', 9, 2],
   ]);
-  game.players[0].chengdiaoUsed = true;
-  game.players[1].chengdiaoUsed = true;
+  game.players[0].chengdiaoCount = 1;
+  game.players[1].chengdiaoCount = 1;
   game.hasDrawnThisTurn = true;
   game.lastDrawnId = game.players[0].hand[0].id;
 
   game.declareWin(0);
 
-  assert.equal(game.result.total, 120);
-  assert.deepEqual(game.result.payments.map((payment) => payment.amount), [40, 40, 40]);
-  assert.deepEqual(game.scores, [120, -40, -40, -40]);
+  assert.equal(game.result.multiplier, 2);
+  assert.equal(game.result.total, 160);
+  assert.deepEqual(game.result.payments.map((payment) => payment.amount), [80, 40, 40]);
+  assert.deepEqual(game.result.payments.map((payment) => payment.multiplier), [4, 2, 2]);
+  assert.deepEqual(game.scores, [160, -80, -40, -40]);
 });
 
-test('没有听牌时不能惩调', () => {
+test('多次惩调后自摸，结算时与付款家倍数相乘', () => {
+  const game = freshGame();
+  game.players[0].hand = tiles([
+    ['wan', 4], ['wan', 5], ['wan', 6],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4],
+    ['tong', 7], ['tong', 8], ['tong', 9],
+    ['wan', 2], ['wan', 3], ['wan', 4],
+    ['tiao', 9, 2],
+  ]);
+  game.players[0].chengdiaoCount = 2;
+  game.players[1].chengdiaoCount = 1;
+  game.players[2].chengdiaoCount = 2;
+  game.hasDrawnThisTurn = true;
+  game.lastDrawnId = game.players[0].hand[0].id;
+
+  game.declareWin(0);
+
+  assert.equal(game.result.multiplier, 4);
+  assert.equal(game.result.perPlayer, 80);
+  assert.equal(game.result.total, 560);
+  assert.deepEqual(game.result.payments.map((payment) => payment.multiplier), [8, 16, 4]);
+  assert.deepEqual(game.result.payments.map((payment) => payment.amount), [160, 320, 80]);
+  assert.deepEqual(game.scores, [560, -160, -320, -80]);
+});
+
+test('手里没有赖子时不能惩调', () => {
   const game = freshGame();
   game.players[0].hand = tiles([
     ['wan', 1], ['wan', 4], ['wan', 7],
@@ -405,6 +458,147 @@ test('不是自己摸来的牌不能直接宣布胡牌', () => {
   ]);
   game.hasDrawnThisTurn = false;
   assert.throws(() => game.declareWin(0), /只能自摸/);
+});
+
+test('赖子不能打出，只能惩调', () => {
+  const game = freshGame();
+  game.players[0].hand = tiles([
+    ['tong', 1], ['wan', 4], ['wan', 5], ['wan', 6],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4], ['tong', 3], ['tong', 4], ['tong', 5],
+  ]);
+  const laizi = game.players[0].hand.find((entry) => entry.key === 'tong-1');
+  assert.throws(() => game.discard(0, laizi.id), /赖子不能打出/);
+  assert.equal(game.players[0].hand.some((entry) => entry.id === laizi.id), true);
+  assert.equal(game.phase, 'discard');
+});
+
+test('惩调可以指定手里的赖子，打出后从牌尾摸一张', () => {
+  const game = freshGame();
+  const baseHand = tiles([
+    ['wan', 4], ['wan', 5], ['wan', 6],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4],
+    ['tong', 7], ['tong', 8], ['tong', 9],
+    ['wan', 2], ['wan', 3], ['tiao', 9],
+    ['tong', 1],
+  ]);
+  const drawn = tile('wan', 9);
+  const tail = tile('tong', 5);
+  game.players[0].hand = [...baseHand, drawn];
+  game.lastDrawnId = drawn.id;
+  game.hasDrawnThisTurn = true;
+  game.wall[game.wall.length - 1] = tail;
+  const laizi = baseHand.find((entry) => entry.key === 'tong-1');
+  const wallBefore = game.wall.length;
+
+  assert.equal(game.canDeclareChengdiao(0), true);
+  assert.throws(() => game.declareChengdiao(0, drawn.id), /只能换赖子/);
+
+  game.declareChengdiao(0, laizi.id);
+  const player = game.players[0];
+  assert.equal(player.chengdiaoCount, 1);
+  assert.equal(player.hand.some((entry) => entry.id === laizi.id), false);
+  assert.equal(player.hand.some((entry) => entry.id === drawn.id), true);
+  assert.equal(player.hand.some((entry) => entry.id === tail.id), true);
+  assert.equal(player.discards.at(-1).id, laizi.id);
+  assert.equal(player.discards.at(-1).chengdiao, true);
+  assert.equal(player.discards.at(-1).key, game.laiziKey);
+  assert.equal(game.wall.length, wallBefore - 1);
+  assert.equal(game.lastDrawnId, tail.id);
+  assert.equal(game.lastDrawFromTail, true);
+  assert.match(game.log[game.log.length - 1].text, /打出赖子并从牌尾摸一张/);
+  assert.match(game.log[game.log.length - 1].text, /×2/);
+});
+
+test('惩调把赖子打到牌河，可以连续惩调，倍数叠加到 ×4', () => {
+  const game = freshGame();
+  const natural = tiles([
+    ['wan', 1], ['wan', 4], ['wan', 7],
+    ['tiao', 2], ['tiao', 5], ['tiao', 8],
+    ['tong', 2], ['tong', 5], ['tong', 8],
+    ['wan', 2], ['wan', 5],
+  ]);
+  const [laiziA, laiziB] = tiles([['tong', 1, 2]]);
+  const drawn = tile('wan', 9);
+  game.players[0].hand = [...natural, laiziA, laiziB, drawn];
+  game.lastDrawnId = drawn.id;
+  game.hasDrawnThisTurn = true;
+  const tailA = tile('wan', 6);
+  game.wall[game.wall.length - 1] = tailA;
+  const wallBefore = game.wall.length;
+
+  game.declareChengdiao(0, laiziA.id);
+  const player = game.players[0];
+  assert.equal(player.chengdiaoCount, 1);
+  assert.equal(game.phase, 'discard');
+  assert.equal(player.discards.at(-1).id, laiziA.id);
+  assert.equal(player.discards.at(-1).chengdiao, true);
+  assert.equal(game.lastDiscard.chengdiao, true);
+  assert.equal(game.wall.length, wallBefore - 1);
+  assert.equal(player.hand.some((entry) => entry.id === tailA.id), true);
+  assert.equal(game.getActions(0).canChengdiao, true);
+  assert.match(game.log[game.log.length - 1].text, /×2/);
+
+  const tailB = tile('wan', 3);
+  game.wall[game.wall.length - 1] = tailB;
+  game.declareChengdiao(0, laiziB.id);
+  assert.equal(player.chengdiaoCount, 2);
+  assert.equal(player.discards.at(-1).id, laiziB.id);
+  assert.equal(player.discards.at(-1).chengdiao, true);
+  assert.equal(game.wall.length, wallBefore - 2);
+  assert.equal(player.hand.some((entry) => entry.id === tailB.id), true);
+  assert.match(game.log[game.log.length - 1].text, /×4/);
+
+  const view = game.viewFor(0);
+  const marked = view.players[0].discards.filter((tile) => tile.chengdiao);
+  assert.deepEqual(marked.map((tile) => tile.id), [laiziA.id, laiziB.id]);
+});
+
+test('赖子不能碰、不能杠，也不能用赖子顶替碰牌', () => {
+  const game = freshGame();
+  const laizi = tile('tong', 1);
+  game.players[1].hand = [tile('wan', 2), ...tiles([['tong', 1, 2]])];
+  assert.deepEqual(game.buildClaimOptions(laizi, 0), {});
+  assert.deepEqual(game.buildClaimOptions(tile('wan', 2), 0), {});
+
+  game.players[0].hand = tiles([
+    ['tong', 1, 4],
+    ['wan', 4], ['wan', 5], ['wan', 6],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4], ['tong', 3], ['tong', 4], ['tong', 5],
+  ]);
+  const gangKeys = game.getGangOptions(0).map((option) => option.key);
+  assert.equal(gangKeys.includes('tong-1'), false);
+});
+
+test('赖子惩调不要求听牌，摸牌后即可打出并从牌尾摸一张', () => {
+  const game = freshGame();
+  const baseHand = tiles([
+    ['wan', 1], ['wan', 4], ['wan', 7],
+    ['tiao', 2], ['tiao', 5], ['tiao', 8],
+    ['tong', 2], ['tong', 5], ['tong', 8],
+    ['wan', 2], ['wan', 5], ['tiao', 1],
+    ['tong', 1],
+  ]);
+  const drawn = tile('wan', 9);
+  const tail = tile('tong', 5);
+  game.players[0].hand = [...baseHand, drawn];
+  game.lastDrawnId = drawn.id;
+  game.hasDrawnThisTurn = true;
+  game.wall[game.wall.length - 1] = tail;
+  const laizi = baseHand.find((entry) => entry.key === 'tong-1');
+  const wallBefore = game.wall.length;
+
+  assert.equal(game.getActions(0).canChengdiao, true);
+
+  game.declareChengdiao(0, laizi.id);
+  const player = game.players[0];
+  assert.equal(player.chengdiaoCount, 1);
+  assert.equal(player.hand.some((entry) => entry.id === laizi.id), false);
+  assert.equal(player.hand.some((entry) => entry.id === drawn.id), true);
+  assert.equal(player.hand.some((entry) => entry.id === tail.id), true);
+  assert.equal(player.discards.at(-1).id, laizi.id);
+  assert.equal(player.discards.at(-1).chengdiao, true);
+  assert.equal(game.wall.length, wallBefore - 1);
+  assert.equal(game.lastDrawnId, tail.id);
 });
 
 test('暗杠三家各付二十分', () => {
@@ -451,6 +645,76 @@ test('碰后摸到第四张可以回回：三家各付十分并扣一张', () =>
   assert.equal(game.log[game.log.length - 1].kind, 'huihui');
   assert.equal(game.log[game.log.length - 1].seat, 0);
   assert.match(game.log[game.log.length - 1].text, /回回/);
+});
+
+test('尾牌暗杠手里三张即可，三家各付二十分且不补牌', () => {
+  const game = freshGame();
+  game.players[0].hand = tiles([
+    ['tong', 9, 3],
+    ['wan', 4], ['wan', 5], ['wan', 6], ['wan', 7], ['wan', 8],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4],
+    ['tong', 3], ['tong', 4], ['tong', 5],
+  ]);
+  const wall = game.wall;
+  game.wall = [];
+  const option = game.getActions(0).gangs.find((gang) => gang.kind === 'tail');
+  assert.ok(option);
+  assert.equal(game.getActions(0).gangs.some((gang) => gang.kind === 'concealed'), false);
+  game.wall = wall;
+
+  const handBefore = game.players[0].hand.length;
+  const wallBefore = game.wall.length;
+  game.declareGang(0, { kind: 'tail', key: 'tong-9' });
+
+  assert.deepEqual(game.scores, [60, -20, -20, -20]);
+  const meld = game.players[0].melds[0];
+  assert.equal(meld.type, 'tailgang');
+  assert.equal(meld.concealed, true);
+  assert.equal(meld.tiles.length, 4);
+  assert.equal(meld.tiles.filter((entry) => entry.key === 'tong-9').length, 4);
+  assert.equal(meld.tiles.some((entry) => entry.id === game.indicator.id), true);
+  assert.equal(game.players[0].hand.length, handBefore - 3);
+  assert.equal(game.wall.length, wallBefore);
+  assert.equal(game.phase, 'discard');
+  assert.equal(game.turnSeat, 0);
+  assert.equal(game.hasDrawnThisTurn, false);
+  assert.equal(game.lastDrawFromTail, false);
+  assert.match(game.log[game.log.length - 1].text, /尾牌暗杠/);
+});
+
+test('尾牌明杠手里两张即可，点杠者付十分且不补牌', () => {
+  const game = freshGame();
+  game.players[0].hand = tiles([
+    ['tong', 9], ['wan', 4], ['wan', 5], ['wan', 6], ['wan', 7], ['wan', 8], ['wan', 9],
+    ['tiao', 2], ['tiao', 3], ['tiao', 4], ['tong', 2], ['tong', 3], ['tong', 4], ['tong', 5],
+  ]);
+  game.players[1].hand = tiles([
+    ['tong', 9, 2], ['wan', 2], ['wan', 3], ['tiao', 2], ['tiao', 5], ['tiao', 7],
+    ['tong', 2], ['tong', 4], ['tong', 6], ['tong', 7], ['tong', 3], ['tong', 5], ['tong', 8],
+  ]);
+  game.players[2].hand = tiles([['wan', 2], ['wan', 3], ['tiao', 1], ['tiao', 8], ['tiao', 9], ['tong', 2], ['tong', 4], ['tong', 6], ['tong', 7], ['tong', 8], ['tong', 3], ['tong', 5], ['tong', 6]]);
+  game.players[3].hand = tiles([['wan', 2], ['wan', 3], ['tiao', 1], ['tiao', 8], ['tiao', 9], ['tong', 2], ['tong', 4], ['tong', 6], ['tong', 7], ['tong', 8], ['tong', 3], ['tong', 5], ['tong', 7]]);
+
+  const handBefore = game.players[1].hand.length;
+  const wallBefore = game.wall.length;
+  const discard = game.players[0].hand.find((entry) => entry.key === 'tong-9');
+  game.discard(0, discard.id);
+  assert.equal(game.getActions(1).canGang, true);
+  game.respondClaim(1, 'gang');
+
+  assert.deepEqual(game.scores, [-10, 10, 0, 0]);
+  const meld = game.players[1].melds[0];
+  assert.equal(meld.type, 'tailgang');
+  assert.equal(meld.concealed, false);
+  assert.equal(meld.tiles.length, 4);
+  assert.equal(meld.tiles.filter((entry) => entry.key === 'tong-9').length, 4);
+  assert.equal(meld.tiles.some((entry) => entry.id === game.indicator.id), true);
+  assert.equal(game.players[1].hand.length, handBefore - 2);
+  assert.equal(game.wall.length, wallBefore);
+  assert.equal(game.phase, 'discard');
+  assert.equal(game.turnSeat, 1);
+  assert.equal(game.lastDrawFromTail, false);
+  assert.match(game.log[game.log.length - 1].text, /尾牌明杠/);
 });
 
 test('面子序列化带上杠牌来源，暗杠四种牌面可见', () => {

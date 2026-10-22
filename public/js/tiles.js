@@ -82,6 +82,11 @@ export function renderMeld(meld, options = {}) {
 function meldTitle(meld, viewerSeat) {
   if (meld.type === 'angang') return '暗杠 · 扣两张';
   if (meld.type === 'huihui' || meld.type === 'bugang') return '回回 · 扣一张';
+  if (meld.type === 'tailgang') {
+    if (meld.concealed) return '尾牌暗杠 · 手里三张';
+    const offset = pointOffset(meld, viewerSeat);
+    return offset == null ? '尾牌明杠' : `尾牌明杠 · 杠自${SOURCE_LABEL[offset]}`;
+  }
   if (meld.type === 'minggang') {
     const offset = pointOffset(meld, viewerSeat);
     return offset == null ? '明杠' : `明杠 · 杠自${SOURCE_LABEL[offset]}`;

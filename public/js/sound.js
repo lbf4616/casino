@@ -251,18 +251,39 @@ class TableAudio {
     this.speak(`${tile.suit}-${tile.rank}`, character);
   }
 
+  announceWin(soft, character) {
+    this.speak('zimo', character, () => this.announceVoice(soft ? '软滴' : '合滴'));
+  }
+
+  announceVoice(text) {
+    if (!this.sfxEnabled || !this.ensureContext()) return;
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'zh-CN';
+      utterance.rate = 0.95;
+      utterance.pitch = 1;
+      window.speechSynthesis.speak(utterance);
+    }
+  }
+
   announceAction(kind, character) {
     const key = ACTION_VOICE[kind];
     if (!key) return;
     this.speak(key, character);
   }
 
-  speak(key, character) {
+  speak(key, character, onEnded) {
     if (!this.sfxEnabled || !this.ensureContext()) return;
     if (this.context.state === 'suspended') this.context.resume().catch(() => {});
     const rate = character?.voiceRate || (character?.gender === 'male' ? 0.8 : 1);
     this.loadVoice(key).then((buffer) => {
-      if (!buffer || !this.sfxEnabled || !this.context) return;
+      if (!this.sfxEnabled || !this.context) return;
+      if (!buffer) {
+        if (key === 'zimo') this.announceVoice('自摸');
+        if (onEnded) setTimeout(onEnded, 1000);
+        return;
+      }
       const now = this.context.currentTime;
       this.stopVoice(now);
       const source = this.context.createBufferSource();
@@ -274,7 +295,10 @@ class TableAudio {
       gain.connect(this.voiceBus);
       this.voiceSource = source;
       source.onended = () => {
-        if (this.voiceSource === source) this.voiceSource = null;
+        if (this.voiceSource === source) {
+          this.voiceSource = null;
+          onEnded?.();
+        }
       };
       source.start(now + 0.1);
     }).catch(() => {});

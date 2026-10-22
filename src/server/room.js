@@ -1,7 +1,8 @@
 'use strict';
 
-const { Game, GameError } = require('./game');
+const { Game, GameError, TURN_LIMIT_MS } = require('./game');
 const bot = require('./bot');
+const { ScoreStore, INITIAL_BALANCE } = require('./scores');
 
 const AVATARS = ['horse', 'monkey', 'snake', 'rabbit', 'pig', 'ox'];
 const AVATAR_NAMES = {
@@ -24,7 +25,7 @@ const CLAIM_RESPONSE_DELAY = [420, 820];
 const OPENING_AUTO_ROLL_DELAY = [850, 1350];
 const TURN_DELAY = [650, 1250];
 const ROOM_IDLE_MS = 30 * 60 * 1000;
-const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const TABLE_ID = 'HOME';
 
 class RoomError extends Error {}
 
@@ -57,6 +58,7 @@ class Room {
     this.lastActivity = Date.now();
     this.botTimer = null;
     this.claimTimer = null;
+    this.turnTimer = null;
     this.scheduleToken = 0;
     this.closed = false;
     this.seats[0] = {
@@ -68,7 +70,7 @@ class Room {
       connected: true,
       auto: false,
       socketId,
-      score: 0,
+      score: this.manager.balances.get(profile.avatar),
     };
   }
 
@@ -89,9 +91,9 @@ class Room {
   }
 
   addHuman(clientId, profile, socketId) {
-    if (this.game) throw new RoomError('牌局已经开始，不能再入座');
     const empty = this.seats.findIndex((player) => !player);
     if (empty < 0) throw new RoomError('这一桌已经坐满了');
+    if (this.game) throw new RoomError('牌局已经开始，不能再入座');
     this.seats[empty] = {
       seat: empty,
       clientId,
@@ -101,7 +103,7 @@ class Room {
       connected: true,
       auto: false,
       socketId,
-      score: 0,
+      score: this.manager.balances.get(profile.avatar),
     };
     this.touch();
     this.broadcast();
@@ -182,7 +184,7 @@ class Room {
         connected: true,
         auto: true,
         socketId: null,
-        score: 0,
+        score: INITIAL_BALANCE,
       };
     }
   }
@@ -196,7 +198,7 @@ class Room {
       avatar: player.avatar,
       isBot: player.isBot,
     }));
-    const scores = this.seats.map(() => 0);
+    const scores = this.seats.map((player) => player.score);
     this.game = new Game({
       actors,
       scores,
@@ -212,10 +214,8 @@ class Room {
     if (!this.game) throw new RoomError('牌局还没有开始');
     if (this.game.phase !== 'ended') throw new RoomError('本局还没有结束');
     if (this.hostSeat !== this.seatOfClient(clientId)) throw new RoomError('只有东家可以开下一局');
+    this.persistScores();
     const scores = [...this.game.scores];
-    for (let i = 0; i < 4; i += 1) {
-      if (this.seats[i]) this.seats[i].score = scores[i];
-    }
     const dealerSeat = this.game.nextDealerSeat;
     const actors = this.seats.map((player) => ({
       name: player.name,
@@ -239,11 +239,7 @@ class Room {
     if (seat < 0) throw new RoomError('你不在这一桌');
     this.game.act(seat, action);
     this.touch();
-    if (this.game.phase === 'ended') {
-      for (let i = 0; i < 4; i += 1) {
-        if (this.seats[i]) this.seats[i].score = this.game.scores[i];
-      }
-    }
+    this.persistScores();
     this.broadcast();
     this.schedule();
   }
@@ -276,6 +272,21 @@ class Room {
   isAutoSeat(seat) {
     const player = this.seats[seat];
     return Boolean(player && (player.isBot || player.auto || !player.connected));
+  }
+
+  // Table scores settle every round; only an all-human table writes the result
+  // back to the characters' saved balances.
+  persistScores() {
+    if (!this.game) return false;
+    for (let i = 0; i < 4; i += 1) {
+      if (this.seats[i]) this.seats[i].score = this.game.scores[i];
+    }
+    if (this.game.phase !== 'ended') return false;
+    if (!this.seats.every((player) => player && !player.isBot)) return false;
+    for (const player of this.seats) {
+      this.manager.balances.set(player.avatar, player.score);
+    }
+    return this.manager.balances.save();
   }
 
   broadcast() {
@@ -322,8 +333,10 @@ class Room {
     const token = (this.scheduleToken += 1);
     clearTimeout(this.botTimer);
     clearTimeout(this.claimTimer);
+    clearTimeout(this.turnTimer);
     this.botTimer = null;
     this.claimTimer = null;
+    this.turnTimer = null;
     if (!this.game || this.game.phase === 'ended') return;
 
     if (this.game.phase === 'opening') {
@@ -398,11 +411,7 @@ class Room {
           return;
         }
         this.touch();
-        if (this.game.phase === 'ended') {
-          for (let i = 0; i < 4; i += 1) {
-            if (this.seats[i]) this.seats[i].score = this.game.scores[i];
-          }
-        }
+        this.persistScores();
         this.broadcast();
         this.schedule();
       }, randomBetween(CLAIM_RESPONSE_DELAY));
@@ -411,44 +420,62 @@ class Room {
 
     if (this.game.phase === 'discard') {
       const seat = this.game.turnSeat;
-      if (!this.isAutoSeat(seat)) return;
-      this.botTimer = setTimeout(() => {
-        if (this.closed || token !== this.scheduleToken) return;
-        if (!this.game || this.game.phase !== 'discard' || this.game.turnSeat !== seat) return;
-        let action = null;
-        try {
-          action = bot.decide(this.game, seat);
-        } catch (error) {
-          action = null;
-        }
-        if (!action) {
-          const player = this.game.playerAt(seat);
-          if (player && player.hand.length > 0) {
-            action = { type: 'discard', tileId: player.hand[0].id };
+      if (this.isAutoSeat(seat)) {
+        this.botTimer = setTimeout(() => {
+          if (this.closed || token !== this.scheduleToken) return;
+          if (!this.game || this.game.phase !== 'discard' || this.game.turnSeat !== seat) return;
+          let action = null;
+          try {
+            action = bot.decide(this.game, seat);
+          } catch (error) {
+            action = null;
           }
-        }
-        if (!action) return;
-        try {
-          this.game.act(seat, action);
-        } catch (error) {
-          const player = this.game.playerAt(seat);
-          if (player && this.game.phase === 'discard' && this.game.turnSeat === seat) {
-            try {
-              this.game.discard(seat, player.hand[0].id);
-            } catch (ignored) {
-              // Stale timer; the new state will schedule its own action.
+          if (!action) {
+            const player = this.game.playerAt(seat);
+            const fallback = player?.hand.find((tile) => tile.key !== this.game.laiziKey);
+            if (fallback) {
+              action = { type: 'discard', tileId: fallback.id };
             }
           }
-        }
-        this.touch();
-        if (this.game && this.game.phase === 'ended') {
-          for (let i = 0; i < 4; i += 1) {
-            if (this.seats[i]) this.seats[i].score = this.game.scores[i];
+          if (!action) return;
+          try {
+            this.game.act(seat, action);
+          } catch (error) {
+            const player = this.game.playerAt(seat);
+            if (player && this.game.phase === 'discard' && this.game.turnSeat === seat) {
+              try {
+                const fallback = player.hand.find((tile) => tile.key !== this.game.laiziKey);
+                if (fallback) this.game.discard(seat, fallback.id);
+              } catch (ignored) {
+                // Stale timer; the new state will schedule its own action.
+              }
+            }
           }
+          this.touch();
+          this.persistScores();
+          this.broadcast();
+          this.schedule();
+        }, randomBetween(TURN_DELAY));
+        return;
+      }
+
+      const deadline = this.game.turnDeadline || (Date.now() + TURN_LIMIT_MS);
+      const wait = Math.max(0, deadline - Date.now());
+      this.turnTimer = setTimeout(() => {
+        if (this.closed || token !== this.scheduleToken) return;
+        if (!this.game || this.game.phase !== 'discard' || this.game.turnSeat !== seat) return;
+        let autoDiscarded = false;
+        try {
+          autoDiscarded = this.game.autoDiscard(seat);
+        } catch (error) {
+          autoDiscarded = false;
         }
+        if (!autoDiscarded) return;
+        this.touch();
+        this.persistScores();
         this.broadcast();
         this.schedule();
-      }, randomBetween(TURN_DELAY));
+      }, wait + 25);
     }
   }
 
@@ -457,6 +484,7 @@ class Room {
     this.closed = true;
     clearTimeout(this.botTimer);
     clearTimeout(this.claimTimer);
+    clearTimeout(this.turnTimer);
     this.manager.removeRoom(this, reason);
   }
 }
@@ -466,19 +494,9 @@ class RoomManager {
     this.io = io;
     this.rooms = new Map();
     this.clientRooms = new Map();
+    this.balances = new ScoreStore();
     this.sweeper = setInterval(() => this.sweep(), 60 * 1000);
     this.sweeper.unref?.();
-  }
-
-  generateCode() {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      let code = '';
-      for (let i = 0; i < 4; i += 1) {
-        code += CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)];
-      }
-      if (!this.rooms.has(code)) return code;
-    }
-    throw new RoomError('房间号生成失败，请重试');
   }
 
   getRoomForClient(clientId) {
@@ -492,11 +510,37 @@ class RoomManager {
     return room;
   }
 
+  takeSeat(room, player, clientId, socket) {
+    const previousClientId = player.clientId;
+    const previousSocket = this.io.sockets.sockets.get(player.socketId);
+    if (previousClientId) this.clientRooms.delete(previousClientId);
+    player.clientId = clientId;
+    this.clientRooms.set(clientId, room.code);
+    room.attach(clientId, socket.id);
+    if (previousSocket && previousSocket.id !== socket.id) {
+      previousSocket.data.replaced = true;
+      previousSocket.emit('session:replaced');
+      previousSocket.disconnect(true);
+    }
+    return room;
+  }
+
   createRoom(clientId, profileInput, socket) {
     const existing = this.getRoomForClient(clientId);
-    if (existing) throw new RoomError('你已经在一个牌局里了');
+    if (existing) {
+      return this.takeSeat(existing, existing.seats[existing.seatOfClient(clientId)], clientId, socket);
+    }
     const profile = cleanProfile(profileInput);
-    const code = this.generateCode();
+    const current = this.rooms.get(TABLE_ID);
+    if (current) {
+      const player = current.seats.find((entry) => entry && !entry.isBot && entry.avatar === profile.avatar);
+      if (player) return this.takeSeat(current, player, clientId, socket);
+      current.addHuman(clientId, profile, socket.id);
+      this.clientRooms.set(clientId, TABLE_ID);
+      current.schedule();
+      return current;
+    }
+    const code = TABLE_ID;
     const room = new Room(this, code, clientId, profile, socket.id);
     this.rooms.set(code, room);
     this.clientRooms.set(clientId, code);
@@ -506,33 +550,14 @@ class RoomManager {
   }
 
   joinRoom(clientId, codeInput, profileInput, socket) {
-    const code = cleanText(codeInput, 4).toUpperCase();
-    if (!/^[A-Z0-9]{4}$/.test(code)) throw new RoomError('请输入四位房间号');
-    const existing = this.getRoomForClient(clientId);
-    if (existing && existing.code === code) {
-      existing.attach(clientId, socket.id);
-      return existing;
-    }
-    if (existing) throw new RoomError('你已经在一个牌局里了');
-    const room = this.rooms.get(code);
-    if (!room) throw new RoomError('没有找到这个房间');
-    if (room.game) throw new RoomError('牌局已经开始，这一桌不再接新玩家');
-    const profile = cleanProfile(profileInput);
-    room.addHuman(clientId, profile, socket.id);
-    this.clientRooms.set(clientId, code);
-    room.schedule();
-    return room;
+    return this.createRoom(clientId, profileInput, socket);
   }
 
   resume(clientId, codeInput, socket) {
-    let room = null;
-    if (codeInput) room = this.rooms.get(cleanText(codeInput, 4).toUpperCase());
-    if (!room) room = this.getRoomForClient(clientId);
+    const room = this.getRoomForClient(clientId);
     if (!room) throw new RoomError('房间已经关闭了');
     if (room.seatOfClient(clientId) < 0) throw new RoomError('你的座位已经释放了');
-    this.clientRooms.set(clientId, room.code);
-    room.attach(clientId, socket.id);
-    return room;
+    return this.takeSeat(room, room.seats[room.seatOfClient(clientId)], clientId, socket);
   }
 
   leave(clientId) {

@@ -8,10 +8,11 @@ const {
   SUIT_LABEL,
   RANK_LABEL,
 } = require('../shared/tiles');
-const { evaluateWin, countWilds, waitTiles } = require('../shared/win');
+const { evaluateWin, countWilds } = require('../shared/win');
 
 const WINDS = ['东', '南', '西', '北'];
 const CLAIM_WINDOW_MS = 10000;
+const TURN_LIMIT_MS = 30000;
 const OPENING_DICE_MS = 1700;
 const OPENING_TILE_MS = 100;
 const OPENING_ROUND_GAP_MS = 220;
@@ -82,7 +83,7 @@ class Game {
       hand: [],
       melds: [],
       discards: [],
-      chengdiaoUsed: false,
+      chengdiaoCount: 0,
     }));
 
     this.wall = buildWall(rng);
@@ -91,8 +92,10 @@ class Game {
     this.laizi = tileFace(this.laiziKey);
     this.log = [];
     this.logSeq = logSequence++;
+    this.logEntrySeq = 0;
     this.phase = 'opening';
     this.turnSeat = dealerSeat;
+    this.turnDeadline = null;
     this.pending = null;
     this.result = null;
     this.lastDiscard = null;
@@ -126,13 +129,16 @@ class Game {
     );
   }
 
-  addLog(kind, text, seat = null, tile = null) {
+  addLog(kind, text, seat = null, tile = null, scoreChanges = null) {
+    const changes = scoreChanges || (['gang', 'huihui'].includes(kind) ? this.lastScoreChanges : null);
+    this.lastScoreChanges = null;
     this.log.push({
-      id: `${this.logSeq}-${this.log.length + 1}`,
+      id: `${this.logSeq}-${++this.logEntrySeq}`,
       kind,
       text,
       seat,
       ...(tile ? { tile } : {}),
+      ...(changes ? { scoreChanges: changes } : {}),
       at: Date.now(),
     });
     if (this.log.length > 80) this.log.shift();
@@ -238,6 +244,7 @@ class Game {
     this.opening.stage = 'done';
     this.phase = 'discard';
     this.turnSeat = this.dealerSeat;
+    this.turnDeadline = Date.now() + TURN_LIMIT_MS;
     return true;
   }
 
@@ -275,55 +282,54 @@ class Game {
     );
   }
 
-  isTenpaiBeforeDraw(player) {
-    if (!this.lastDrawnId) return false;
-    const index = player.hand.findIndex((tile) => tile.id === this.lastDrawnId);
-    if (index < 0) return false;
-    const rest = [...player.hand.slice(0, index), ...player.hand.slice(index + 1)];
-    if (rest.length !== (4 - player.melds.length) * 3 + 1) return false;
-    return waitTiles(rest, player.melds.length, this.laiziKey).length > 0;
-  }
-
   canDeclareChengdiao(seat) {
     const player = this.players[seat];
     return (
       this.phase === 'discard'
       && this.turnSeat === seat
       && this.hasDrawnThisTurn
-      && !player.chengdiaoUsed
       && this.wall.length > 0
       && !this.canPlayerWin(seat)
-      && this.isTenpaiBeforeDraw(player)
+      && this.getWildCount(player) > 0
     );
   }
 
-  declareChengdiao(seat) {
+  declareChengdiao(seat, tileId) {
     if (!this.canDeclareChengdiao(seat)) throw new GameError('现在不能惩调');
     const player = this.players[seat];
-    const index = player.hand.findIndex((tile) => tile.id === this.lastDrawnId);
-    const [drawnTile] = player.hand.splice(index, 1);
+    const swapTile = player.hand.find(
+      (tile) => tile.key === this.laiziKey && (!tileId || tile.id === tileId),
+    );
+    if (!swapTile) throw new GameError('惩调只能换赖子');
+    const [removed] = player.hand.splice(player.hand.indexOf(swapTile), 1);
+    player.discards.push({ ...removed, chengdiao: true });
     const tailTile = this.wall.pop();
-    this.wall.push(drawnTile);
     player.hand.push(tailTile);
     player.hand = sortTiles(player.hand);
-    player.chengdiaoUsed = true;
+    player.chengdiaoCount += 1;
     this.hasDrawnThisTurn = true;
     this.lastDrawnId = tailTile.id;
     this.lastDrawFromTail = true;
-    this.addLog('chengdiao', `${player.name} 惩调，从牌尾换了一张牌，本局输赢翻倍`, seat);
+    this.lastDiscard = { seat, tile: publicTile(removed), chengdiao: true };
+    const multiplier = 2 ** player.chengdiaoCount;
+    this.addLog(
+      'chengdiao',
+      `${player.name} 惩调，打出赖子并从牌尾摸一张，本局输赢 ×${multiplier}`,
+      seat,
+      publicTile(removed),
+    );
   }
 
   getGangOptions(seat) {
-    if (this.phase !== 'discard' || this.turnSeat !== seat || this.wall.length === 0) {
-      return [];
-    }
+    if (this.phase !== 'discard' || this.turnSeat !== seat) return [];
     const player = this.players[seat];
+    const canDrawReplacement = this.wall.length > 0;
     const options = [];
     const counted = new Set();
     for (const tile of player.hand) {
       if (tile.key === this.laiziKey || counted.has(tile.key)) continue;
       const count = this.getNaturalCount(player, tile.key);
-      if (count === 4) {
+      if (count === 4 && canDrawReplacement) {
         options.push({
           kind: 'concealed',
           key: tile.key,
@@ -331,20 +337,31 @@ class Game {
           tiles: [publicTile(tile)],
         });
       }
-      counted.add(tile.key);
-    }
-    player.melds.forEach((meld, meldIndex) => {
-      if (meld.type !== 'peng' || meld.key === this.laiziKey) return;
-      if (this.getNaturalCount(player, meld.key) > 0) {
+      // 尾牌已经翻出一张，手里剩三张即可凑成四张暗杠，且不需要补牌。
+      if (tile.key === this.indicator.key && count === 3) {
         options.push({
-          kind: 'huihui',
-          key: meld.key,
-          meldIndex,
-          label: tileLabel(meld.tiles[0]),
-          tiles: [publicTile(meld.tiles[0])],
+          kind: 'tail',
+          key: tile.key,
+          label: tileLabel(tile),
+          tiles: [publicTile(tile)],
         });
       }
-    });
+      counted.add(tile.key);
+    }
+    if (canDrawReplacement) {
+      player.melds.forEach((meld, meldIndex) => {
+        if (meld.type !== 'peng' || meld.key === this.laiziKey) return;
+        if (this.getNaturalCount(player, meld.key) > 0) {
+          options.push({
+            kind: 'huihui',
+            key: meld.key,
+            meldIndex,
+            label: tileLabel(meld.tiles[0]),
+            tiles: [publicTile(meld.tiles[0])],
+          });
+        }
+      });
+    }
     return options;
   }
 
@@ -370,7 +387,7 @@ class Game {
         canDiscard: true,
         canWin: this.canDeclareWin(seat),
         canChengdiao: this.canDeclareChengdiao(seat),
-        chengdiaoUsed: this.players[seat].chengdiaoUsed,
+        chengdiaoCount: this.players[seat].chengdiaoCount,
         gangs: this.getGangOptions(seat),
         drawnTileId: this.hasDrawnThisTurn ? this.lastDrawnId : null,
         fromTail: this.lastDrawFromTail,
@@ -385,6 +402,7 @@ class Game {
     const player = this.players[seat];
     const index = player.hand.findIndex((tile) => tile.id === tileId);
     if (index < 0) throw new GameError('这张牌不在手中');
+    if (player.hand[index].key === this.laiziKey) throw new GameError('赖子不能打出，只能惩调');
 
     const [tile] = player.hand.splice(index, 1);
     player.discards.push(tile);
@@ -392,6 +410,7 @@ class Game {
     this.hasDrawnThisTurn = false;
     this.lastDrawnId = null;
     this.lastDrawFromTail = false;
+    this.turnDeadline = null;
     this.addLog('discard', `${player.name} 打出 ${tileLabel(tile)}`, seat, publicTile(tile));
 
     const options = this.buildClaimOptions(tile, seat);
@@ -410,6 +429,22 @@ class Game {
     this.advanceAfterDiscard(seat);
   }
 
+  autoDiscard(seat) {
+    if (this.phase !== 'discard' || this.turnSeat !== seat) return false;
+    const player = this.players[seat];
+    if (!player || player.hand.length === 0) return false;
+    const drawn = this.lastDrawnId
+      ? player.hand.find((tile) => tile.id === this.lastDrawnId)
+      : null;
+    const natural = player.hand.filter((tile) => tile.key !== this.laiziKey);
+    const tile = (drawn && drawn.key !== this.laiziKey)
+      ? drawn
+      : natural[natural.length - 1] || player.hand[player.hand.length - 1];
+    this.addLog('timeout', `${player.name} 超时未出牌，自动打出 ${tileLabel(tile)}`, seat);
+    this.discard(seat, tile.id);
+    return true;
+  }
+
   buildClaimOptions(tile, fromSeat) {
     const options = {};
     if (tile.key === this.laiziKey) return options;
@@ -417,9 +452,11 @@ class Game {
       if (player.seat === fromSeat) continue;
       const count = this.getNaturalCount(player, tile.key);
       if (count >= 2) {
+        const isTailTile = tile.key === this.indicator.key;
         options[player.seat] = {
           peng: true,
-          gang: count >= 3 && this.wall.length > 0,
+          // 尾牌明杠只要手里两张：翻出的那张补第四张，且杠后不补牌。
+          gang: isTailTile || (count >= 3 && this.wall.length > 0),
         };
       }
     }
@@ -494,6 +531,7 @@ class Game {
     this.hasDrawnThisTurn = false;
     this.lastDrawnId = null;
     this.lastDrawFromTail = false;
+    this.turnDeadline = Date.now() + TURN_LIMIT_MS;
 
     if (winner.choice === 'peng') {
       this.takeTiles(player, pending.tile.key, 2);
@@ -514,22 +552,30 @@ class Game {
     }
 
     if (winner.choice === 'gang') {
-      this.takeTiles(player, pending.tile.key, 3);
-      const claimed = this.takeClaimedTile(pending.tile, 3);
+      const tailGang = pending.tile.key === this.indicator.key;
+      this.takeTiles(player, pending.tile.key, tailGang ? 2 : 3);
+      const claimed = this.takeClaimedTile(pending.tile, tailGang ? 2 : 3);
+      if (tailGang) claimed.push({ ...publicTile(this.indicator) });
       player.melds.push({
         id: `meld-${this.logSeq}-${Date.now()}`,
-        type: 'minggang',
+        type: tailGang ? 'tailgang' : 'minggang',
         key: pending.tile.key,
-        tiles: claimed,
+        concealed: false,
+        tiles: tailGang ? sortTiles(claimed) : claimed,
         fromSeat: pending.fromSeat,
       });
-      this.payGang(winner.seat, [pending.fromSeat], GANG_POINTS.exposed);
+      this.payGang(
+        winner.seat,
+        [pending.fromSeat],
+        GANG_POINTS.exposed,
+        tailGang ? '尾牌明杠' : '明杠',
+      );
       this.addLog(
         'gang',
-        `${player.name} 明杠${fromPlayer.name}的${tileLabel(pending.tile)}，${fromPlayer.name}付10分`,
+        `${player.name} ${tailGang ? '尾牌明杠' : '明杠'}${fromPlayer.name}的${tileLabel(pending.tile)}，${fromPlayer.name}付10分`,
         player.seat,
       );
-      this.drawFromTail(winner.seat);
+      if (!tailGang) this.drawFromTail(winner.seat);
     }
   }
 
@@ -576,6 +622,7 @@ class Game {
     player.hand = sortTiles(player.hand);
     this.turnSeat = seat;
     this.phase = 'discard';
+    this.turnDeadline = Date.now() + TURN_LIMIT_MS;
     this.hasDrawnThisTurn = true;
     this.lastDrawnId = tile.id;
     this.lastDrawFromTail = fromTail;
@@ -589,15 +636,19 @@ class Game {
     this.drawFor(seat, true);
   }
 
-  payGang(winnerSeat, payerSeats, amount) {
+  payGang(winnerSeat, payerSeats, amount, label) {
     let received = 0;
+    const scoreChanges = payerSeats.map((seat) => ({ seat, delta: -amount }));
     for (const payer of payerSeats) {
       this.scores[payer] -= amount;
       received += amount;
     }
     this.scores[winnerSeat] += received;
+    scoreChanges.push({ seat: winnerSeat, delta: received });
+    this.lastScoreChanges = scoreChanges;
     this.scoreEvents.push({
       type: 'gang',
+      label,
       seat: winnerSeat,
       payers: payerSeats,
       amount,
@@ -635,8 +686,33 @@ class Game {
         tiles,
         concealed: true,
       });
-      this.payGang(seat, others, GANG_POINTS.concealed);
+      this.payGang(seat, others, GANG_POINTS.concealed, '暗杠');
       this.addLog('gang', `${player.name} 暗杠，三家各付20分`, seat);
+    } else if (match.kind === 'tail') {
+      this.takeTiles(player, match.key, 3);
+      const face = tileFace(match.key);
+      const tiles = [0, 1, 2].map((i) => ({
+        id: `${match.key}-tail-${Date.now()}-${i}`,
+        suit: face.suit,
+        rank: face.rank,
+        key: face.key,
+      }));
+      tiles.push({ ...publicTile(this.indicator) });
+      player.melds.push({
+        id: `meld-${this.logSeq}-${Date.now()}`,
+        type: 'tailgang',
+        key: match.key,
+        tiles: sortTiles(tiles),
+        concealed: true,
+      });
+      this.payGang(seat, others, GANG_POINTS.concealed, '尾牌暗杠');
+      this.addLog('gang', `${player.name} 尾牌暗杠，三家各付20分`, seat);
+      player.hand = sortTiles(player.hand);
+      this.hasDrawnThisTurn = false;
+      this.lastDrawnId = null;
+      this.lastDrawFromTail = false;
+      this.turnDeadline = Date.now() + TURN_LIMIT_MS;
+      return;
     } else {
       const meld = player.melds[match.meldIndex];
       const index = player.hand.findIndex((tile) => tile.key === match.key);
@@ -645,7 +721,7 @@ class Game {
       meld.type = 'huihui';
       meld.tiles.push(tile);
       meld.tiles = sortTiles(meld.tiles);
-      this.payGang(seat, others, GANG_POINTS.huihui);
+      this.payGang(seat, others, GANG_POINTS.huihui, '回回');
       this.addLog('huihui', `${player.name} 回回，三家各付10分`, seat);
     }
 
@@ -668,17 +744,23 @@ class Game {
     if (!evaluation.win) throw new GameError('这副牌还没有胡');
     if (evaluation.wildCount > 1) throw new GameError('手上赖子超过一张，不能胡');
 
-    const soft = evaluation.wildCount === 1;
+    const soft = evaluation.soft;
     const base = soft ? 10 : 20;
-    const winnerChengdiao = player.chengdiaoUsed;
+    const winnerChengdiaoCount = player.chengdiaoCount;
+    const winnerChengdiao = winnerChengdiaoCount > 0;
+    const winnerMultiplier = 2 ** winnerChengdiaoCount;
     const others = [0, 1, 2, 3].filter((other) => other !== seat);
     const payments = others.map((other) => {
-      const payerChengdiao = this.players[other].chengdiaoUsed;
-      const doubled = winnerChengdiao || payerChengdiao;
+      const payerChengdiaoCount = this.players[other].chengdiaoCount;
+      const payerMultiplier = 2 ** payerChengdiaoCount;
+      const multiplier = winnerMultiplier * payerMultiplier;
       return {
         seat: other,
-        amount: base * (doubled ? 2 : 1),
-        payerChengdiao,
+        amount: base * multiplier,
+        payerChengdiao: payerChengdiaoCount > 0,
+        payerChengdiaoCount,
+        payerMultiplier,
+        multiplier,
       };
     });
     const total = payments.reduce((sum, payment) => sum + payment.amount, 0);
@@ -687,9 +769,9 @@ class Game {
       this.scores[seat] += payment.amount;
     }
 
-    const multiplier = winnerChengdiao ? 2 : 1;
+    const multiplier = winnerMultiplier;
     const perPlayer = base * multiplier;
-    const title = soft ? '软胡自摸' : '素胡自摸';
+    const title = soft ? '软滴自摸' : '合滴自摸';
     this.phase = 'ended';
     this.pending = null;
     this.result = {
@@ -704,19 +786,24 @@ class Game {
       total,
       payments,
       winnerChengdiao,
+      winnerChengdiaoCount,
+      winnerMultiplier,
       chengdiaoSeats: this.players
-        .filter((entry) => entry.chengdiaoUsed)
+        .filter((entry) => entry.chengdiaoCount > 0)
         .map((entry) => entry.seat),
-      reason: winnerChengdiao ? '惩调' : '自摸',
+      reason: winnerChengdiao ? `惩调×${winnerMultiplier}` : '自摸',
+      scoreEvents: [...this.scoreEvents],
       deltas: this.scores.map((score, index) => score - this.initialScores[index]),
       reveal: this.revealHands(),
     };
     this.nextDealerSeat = seat;
-    const doubledPayers = payments.filter((payment) => payment.payerChengdiao);
+    const chengdiaoPayers = payments.filter((payment) => payment.payerChengdiao);
     const notes = [];
-    if (winnerChengdiao) notes.push('惩调×2');
-    if (doubledPayers.length > 0) {
-      notes.push(`${doubledPayers.map((payment) => this.players[payment.seat].name).join('、')}惩调付双倍`);
+    if (winnerChengdiao) notes.push(`惩调×${winnerMultiplier}`);
+    if (chengdiaoPayers.length > 0) {
+      notes.push(chengdiaoPayers
+        .map((payment) => `${this.players[payment.seat].name}惩调付×${payment.multiplier}`)
+        .join('、'));
     }
     this.addLog(
       'hu',
@@ -732,6 +819,7 @@ class Game {
       type: 'draw',
       winnerSeat: null,
       title: '荒庄',
+      scoreEvents: [...this.scoreEvents],
       deltas: this.scores.map((score, index) => score - this.initialScores[index]),
       reveal: this.revealHands(),
     };
@@ -764,7 +852,7 @@ class Game {
     if (action.type === 'discard') return this.discard(seat, action.tileId);
     if (action.type === 'win') return this.declareWin(seat);
     if (action.type === 'gang') return this.declareGang(seat, action);
-    if (action.type === 'chengdiao') return this.declareChengdiao(seat);
+    if (action.type === 'chengdiao') return this.declareChengdiao(seat, action.tileId);
     throw new GameError('无效操作');
   }
 
@@ -791,7 +879,9 @@ class Game {
       score: this.scores[entry.seat],
       handCount: entry.hand.length,
       melds: this.serializeMelds(entry.seat),
-      discards: entry.discards.map(publicTile),
+      discards: entry.discards.map((tile) => (
+        tile.chengdiao ? { ...publicTile(tile), chengdiao: true } : publicTile(tile)
+      )),
     }));
 
     const pendingPublic = this.pending
@@ -813,9 +903,14 @@ class Game {
       dealerSeat: this.dealerSeat,
       turnSeat: this.turnSeat,
       phase: this.phase,
+      turnDeadline: this.phase === 'discard' ? this.turnDeadline : null,
+      turnLimitMs: TURN_LIMIT_MS,
       wallLeft: this.wall.length,
       indicator: publicTile(this.indicator),
       laizi: this.laizi,
+      wallBreak: this.opening.dice
+        ? { dice: this.opening.dice, direction: this.opening.direction }
+        : null,
       opening: this.phase === 'opening' ? {
         dealerSeat: this.opening.dealerSeat,
         stage: this.opening.stage,
@@ -840,7 +935,7 @@ class Game {
         hand: player.hand.map(publicTile),
         melds: this.serializeMelds(seat),
         wildCount: this.getWildCount(player),
-        chengdiaoUsed: player.chengdiaoUsed,
+        chengdiaoCount: player.chengdiaoCount,
         actions: this.getActions(seat),
         canWin: this.canDeclareWin(seat),
       },
@@ -860,8 +955,11 @@ class Game {
         total: this.result.total,
         payments: this.result.payments,
         winnerChengdiao: this.result.winnerChengdiao,
+        winnerChengdiaoCount: this.result.winnerChengdiaoCount,
+        winnerMultiplier: this.result.winnerMultiplier,
         chengdiaoSeats: this.result.chengdiaoSeats,
         reason: this.result.reason,
+        scoreEvents: this.result.scoreEvents || [],
         deltas: this.result.deltas,
         reveal: this.result.reveal,
       } : null,
@@ -876,6 +974,7 @@ module.exports = {
   Game,
   GameError,
   CLAIM_WINDOW_MS,
+  TURN_LIMIT_MS,
   OPENING_DICE_MS,
   DICE_DIRECTION,
   DIRECTION_LABEL,

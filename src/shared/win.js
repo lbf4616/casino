@@ -102,6 +102,10 @@ function evaluateWin(handTiles, meldCount, laiziKey) {
     return { win: isStandardCounts([...baseCounts], meldCount), wildCount, soft: false };
   }
 
+  if (isStandardCounts(tilesToCounts(handTiles), meldCount)) {
+    return { win: true, wildCount, soft: false };
+  }
+
   for (let i = 0; i < 27; i += 1) {
     const counts = [...baseCounts];
     counts[i] += 1;
