@@ -12,7 +12,7 @@ const TILE_KEYS = [];
 for (const suit of ['wan', 'tong', 'tiao']) {
   for (let rank = 1; rank <= 9; rank += 1) TILE_KEYS.push(`${suit}-${rank}`);
 }
-const ACTION_VOICE_KEYS = ['peng', 'gang', 'zimo', 'cheng', 'huihui'];
+const ACTION_VOICE_KEYS = ['peng', 'gang', 'zimo', 'cheng', 'huihui', 'hedi', 'ruandi'];
 const ACTION_VOICE = {
   peng: 'peng',
   gang: 'gang',
@@ -214,7 +214,7 @@ class TableAudio {
   }
 
   voiceURL(key) {
-    return `/assets/voice/${key}.mp3?v=20261018-17`;
+    return `/assets/voice/${key}.mp3?v=20261022-1`;
   }
 
   loadVoice(key) {
@@ -252,7 +252,7 @@ class TableAudio {
   }
 
   announceWin(soft, character) {
-    this.speak('zimo', character, () => this.announceVoice(soft ? '软滴' : '合滴'));
+    this.speak('zimo', character, () => this.speak(soft ? 'ruandi' : 'hedi', character));
   }
 
   announceVoice(text) {

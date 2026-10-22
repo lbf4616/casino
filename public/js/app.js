@@ -357,21 +357,7 @@ function seatEffectAnchor(seat) {
   };
 }
 
-function showSeatAction(entry) {
-  const label = actionLabel(entry.kind);
-  if (!flashLayer || !label || entry.seat === null || entry.seat === undefined) return;
-  const anchor = seatEffectAnchor(entry.seat);
-  if (!anchor) return;
-  const node = document.createElement('span');
-  node.className = `seat-action-pop seat-action-pop--${entry.kind}`;
-  node.textContent = label;
-  node.style.left = `${anchor.x}px`;
-  node.style.top = `${anchor.y - 36}px`;
-  flashLayer.appendChild(node);
-  requestAnimationFrame(() => node.classList.add('is-visible'));
-  setTimeout(() => node.classList.add('is-leaving'), 1050);
-  setTimeout(() => node.remove(), 1450);
-
+function showScorePops(entry) {
   (entry.scoreChanges || []).forEach((change) => {
     const changeAnchor = seatEffectAnchor(change.seat);
     if (!changeAnchor || !change.delta) return;
@@ -386,6 +372,39 @@ function showSeatAction(entry) {
     setTimeout(() => amount.classList.add('is-leaving'), 1150);
     setTimeout(() => amount.remove(), 1550);
   });
+}
+
+const FLASH_HOLD_MS = 380;
+const FLASH_TRAVEL_MS = 460;
+
+function flashActionToSeat(entry) {
+  const label = actionLabel(entry.kind);
+  if (!flashLayer || !label || entry.seat === null || entry.seat === undefined) return;
+
+  const node = document.createElement('div');
+  node.className = `table-flash table-flash--${entry.kind} table-flash--travel`;
+  node.textContent = label;
+  flashLayer.appendChild(node);
+  requestAnimationFrame(() => node.classList.add('is-visible'));
+
+  const anchor = seatEffectAnchor(entry.seat);
+  if (!anchor) {
+    setTimeout(() => node.remove(), 1100);
+    return;
+  }
+
+  setTimeout(() => {
+    const rect = node.getBoundingClientRect();
+    const dx = anchor.x - (rect.left + rect.width / 2);
+    const dy = anchor.y - (rect.top + rect.height / 2);
+    node.style.transition = 'none';
+    node.style.transform = 'scale(1)';
+    void node.offsetWidth;
+    node.style.transform = `translate(${dx}px, ${dy}px) scale(0.16)`;
+    node.style.opacity = '0';
+    node.style.transition = `transform ${FLASH_TRAVEL_MS}ms cubic-bezier(0.5, 0, 0.75, 0), opacity ${FLASH_TRAVEL_MS}ms ease-in`;
+    setTimeout(() => node.remove(), FLASH_TRAVEL_MS + 60);
+  }, FLASH_HOLD_MS);
 }
 
 function setModal(modal) {
@@ -555,11 +574,12 @@ function playLogFeedback(logs, isNewRound, room) {
     return;
   }
 
-  usable.filter((entry) => actionLabel(entry.kind)).forEach(showSeatAction);
+  usable.forEach(showScorePops);
 
   const priority = { hu: 6, gang: 5, huihui: 4, chengdiao: 3, peng: 2, start: 2, discard: 1, drawEnd: 0 };
   usable.sort((a, b) => (priority[a.kind] || 0) - (priority[b.kind] || 0));
   const chosen = usable[usable.length - 1];
+  if (actionLabel(chosen.kind)) flashActionToSeat(chosen);
   if (chosen.kind === 'hu') {
     audio.play('hu');
     audio.announceWin(room.game?.result?.soft, getCharacter(room?.seats?.find((entry) => entry?.seat === chosen.seat)?.avatar));

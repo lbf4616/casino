@@ -5512,7 +5512,6 @@ button.tile {
   overflow: visible;
 }
 
-.seat-action-pop,
 .seat-score-pop {
   position: absolute;
   z-index: 40;
@@ -5521,40 +5520,10 @@ button.tile {
   white-space: nowrap;
 }
 
-.seat-action-pop {
-  top: -42px;
-  left: 50%;
-  color: #f7d99f;
-  font-family: var(--serif);
-  font-size: clamp(26px, 4.4vmin, 45px);
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  line-height: 1;
-  text-shadow: 0 3px 0 rgba(31, 35, 24, 0.3), 0 0 18px rgba(220, 195, 151, 0.65);
-  transform: translate(-50%, 10px) scale(0.55) rotate(-7deg);
+.table-flash--travel {
+  will-change: transform, opacity;
+  transform-origin: center center;
 }
-
-.seat-action-pop::after {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 76px;
-  height: 76px;
-  border: 1px solid rgba(220, 195, 151, 0.52);
-  border-radius: 50%;
-  content: "";
-  transform: translate(-50%, -50%);
-  animation: seat-action-ring 0.9s ease-out both;
-}
-
-.seat-action-pop.is-visible {
-  animation: seat-action-in 0.42s cubic-bezier(0.2, 1.5, 0.35, 1) forwards;
-}
-
-.seat-action-pop.is-leaving {
-  animation: seat-action-out 0.38s ease-in forwards;
-}
-
 .seat-score-pop {
   top: -4px;
   right: -34px;
@@ -5571,21 +5540,6 @@ button.tile {
 .seat-score-pop.is-negative { color: #9ee0af; }
 .seat-score-pop.is-visible { animation: score-pop-in 0.3s ease-out forwards; }
 .seat-score-pop.is-leaving { animation: score-pop-out 0.35s ease-in forwards; }
-
-@keyframes seat-action-in {
-  0% { opacity: 0; transform: translate(-50%, 18px) scale(0.45) rotate(-10deg); }
-  65% { opacity: 1; transform: translate(-50%, -4px) scale(1.08) rotate(2deg); }
-  100% { opacity: 1; transform: translate(-50%, 0) scale(1) rotate(0); }
-}
-
-@keyframes seat-action-out {
-  to { opacity: 0; transform: translate(-50%, -28px) scale(1.08) rotate(4deg); }
-}
-
-@keyframes seat-action-ring {
-  0% { opacity: 0.8; transform: translate(-50%, -50%) scale(0.3); }
-  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.45); }
-}
 
 @keyframes score-pop-in {
   to { opacity: 1; transform: translateY(-22px) scale(1); }

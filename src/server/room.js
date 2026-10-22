@@ -23,7 +23,7 @@ const BOT_PROFILES = [
 ];
 const CLAIM_RESPONSE_DELAY = [420, 820];
 const OPENING_AUTO_ROLL_DELAY = [850, 1350];
-const TURN_DELAY = [650, 1250];
+const TURN_DELAY = [1150, 2100];
 const ROOM_IDLE_MS = 30 * 60 * 1000;
 const TABLE_ID = 'HOME';
 
